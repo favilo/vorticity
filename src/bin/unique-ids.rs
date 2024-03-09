@@ -1,8 +1,11 @@
-use std::io::{StdoutLock, Write};
+use std::{
+    io::{StdoutLock, Write},
+    sync::mpsc::Sender,
+};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use vorticity::{main_loop, Message, Node};
+use vorticity::{main_loop, Event, Message, Node};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -21,7 +24,10 @@ pub struct UniqueNode {
 }
 
 impl Node<(), Payload> for UniqueNode {
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+        let Event::Message(input) = input else {
+            unreachable!();
+        };
         let mut reply = input.into_reply(Some(&mut self.msg_id));
         match reply.body.payload {
             Payload::Generate => {
@@ -38,7 +44,11 @@ impl Node<(), Payload> for UniqueNode {
         Ok(())
     }
 
-    fn from_init(_state: (), init: vorticity::Init) -> anyhow::Result<Self>
+    fn from_init(
+        _state: (),
+        init: vorticity::Init,
+        _tx: Sender<Event<Payload>>,
+    ) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -50,5 +60,5 @@ impl Node<(), Payload> for UniqueNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<(), UniqueNode, Payload>(())
+    main_loop::<_, UniqueNode, _, _>(())
 }

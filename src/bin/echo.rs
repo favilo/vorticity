@@ -1,8 +1,11 @@
-use std::io::{StdoutLock, Write};
+use std::{
+    io::{StdoutLock, Write},
+    sync::mpsc::Sender,
+};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use vorticity::{main_loop, Message, Node};
+use vorticity::{main_loop, Event, Node};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -17,7 +20,10 @@ pub struct EchoNode {
 }
 
 impl Node<(), Payload> for EchoNode {
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+        let Event::Message(input) = input else {
+            unreachable!()
+        };
         let mut reply = input.into_reply(Some(&mut self.id));
         match reply.body.payload {
             Payload::Echo { echo } => {
@@ -32,7 +38,11 @@ impl Node<(), Payload> for EchoNode {
         Ok(())
     }
 
-    fn from_init(_state: (), _init: vorticity::Init) -> anyhow::Result<Self>
+    fn from_init(
+        _state: (),
+        _init: vorticity::Init,
+        _tx: Sender<Event<Payload>>,
+    ) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -41,5 +51,5 @@ impl Node<(), Payload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, EchoNode, Payload>(())
+    main_loop::<_, EchoNode, _, _>(())
 }
