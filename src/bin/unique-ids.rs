@@ -1,8 +1,8 @@
 use std::io::{StdoutLock, Write};
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use vorticity::{main_loop, Body, Message, Node};
+use vorticity::{main_loop, Message, Node};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -22,26 +22,18 @@ pub struct UniqueNode {
 
 impl Node<(), Payload> for UniqueNode {
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
-        match input.body.payload {
+        let mut reply = input.into_reply(Some(&mut self.msg_id));
+        match reply.body.payload {
             Payload::Generate => {
                 let guid = format!("{}-{}", self.node, self.msg_id);
-                let reply = Message {
-                    src: input.dst,
-                    dst: input.src,
-                    body: Body {
-                        id: Some(self.msg_id),
-                        in_reply_to: input.body.id,
-                        payload: Payload::GenerateOk { guid },
-                    },
-                };
+                reply.body.payload = Payload::GenerateOk { guid };
 
                 serde_json::to_writer(&mut *output, &reply)
                     .context("serialize response to generate")?;
                 output.write_all(b"\n").context("write newline to output")?;
             }
-            Payload::GenerateOk { .. } => bail!("Unexpected GenerateOk message"),
+            Payload::GenerateOk { .. } => {}
         }
-        self.msg_id += 1;
 
         Ok(())
     }
