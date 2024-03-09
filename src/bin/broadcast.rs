@@ -1,14 +1,25 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{StdoutLock, Write},
+    io::StdoutLock,
     sync::mpsc::Sender,
     time::Duration,
 };
 
 use anyhow::Context;
-use rand::prelude::*;
+use base64::{
+    engine::{GeneralPurpose, GeneralPurposeConfig},
+    Engine,
+};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use vorticity::{main_loop, Body, Event, Message, Node};
+use yrs::{
+    updates::{decoder::Decode, encoder::Encode},
+    Array, ReadTxn, Transact,
+};
+
+const ENGINE: GeneralPurpose =
+    GeneralPurpose::new(&base64::alphabet::URL_SAFE, GeneralPurposeConfig::new());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -28,7 +39,8 @@ pub enum Payload {
     TopologyOk,
 
     Gossip {
-        seen: HashSet<usize>,
+        diff: String,
+        state_vector: String,
     },
 }
 
@@ -39,11 +51,10 @@ enum InjectedPayload {
 pub struct BroadcastNode {
     msg_id: usize,
     node_id: String,
-    messages: HashSet<usize>,
-    known: HashMap<String, HashSet<usize>>,
+    doc: yrs::Doc,
+    messages: yrs::ArrayRef,
+    known: HashMap<String, yrs::StateVector>,
     neighborhood: Vec<String>,
-
-    msg_communicated: HashMap<usize, HashSet<usize>>,
 }
 
 impl Node<(), Payload, InjectedPayload> for BroadcastNode {
@@ -57,16 +68,28 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 let mut reply = input.into_reply(Some(&mut self.msg_id));
                 match reply.body.payload {
                     Payload::Broadcast { message } => {
-                        self.messages.insert(message);
+                        let mut txn = self.doc.transact_mut();
+                        self.messages.push_back(&mut txn, message as i64);
+
                         reply.body.payload = Payload::BroadcastOk;
                         reply
                             .send(&mut *output)
                             .context("serialize response to broadcast")?;
                     }
                     Payload::Read => {
-                        reply.body.payload = Payload::ReadOk {
-                            messages: self.messages.clone(),
-                        };
+                        let txn = self.doc.transact();
+                        let messages = self
+                            .messages
+                            .iter(&txn)
+                            .map(|v| {
+                                v.cast::<i64>()
+                                    .expect("Not an integer")
+                                    .try_into()
+                                    .expect("all messages should be positive")
+                            })
+                            .collect();
+
+                        reply.body.payload = Payload::ReadOk { messages };
                         reply
                             .send(&mut *output)
                             .context("serialize response to read")?;
@@ -80,12 +103,20 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             .send(&mut *output)
                             .context("serialize response to topology")?;
                     }
-                    Payload::Gossip { seen } => {
-                        self.known
-                            .get_mut(&reply.dst)
-                            .expect("got gossip from unknown node")
-                            .extend(seen.iter().copied());
-                        self.messages.extend(seen);
+                    Payload::Gossip { state_vector, diff } => {
+                        let state_vector = yrs::StateVector::decode_v1(
+                            &ENGINE
+                                .decode(&state_vector)
+                                .context("base64 decode failed")?,
+                        )
+                        .context("StateVector decode failed")?;
+                        let update = yrs::Update::decode_v1(
+                            &ENGINE.decode(&diff).context("base64 decode failed")?,
+                        )
+                        .context("Update decode failed")?;
+                        self.known.insert(reply.dst, state_vector);
+                        let mut txn = self.doc.transact_mut();
+                        txn.apply_update(update);
                     }
                     Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
                 }
@@ -94,37 +125,30 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             Event::Injected(input) => match input {
                 InjectedPayload::Gossip => {
                     for n in &self.neighborhood {
-                        let known_to_n = &self.known[n];
-                        let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = self
-                            .messages
-                            .iter()
-                            .copied()
-                            .partition(|n| known_to_n.contains(n));
-                        // if we know that n knows m, we don't tell n that _we_ know m, so n will
-                        // send us m for all eternity. So, we include a couple extra m's so they
-                        // gradually know all the m's we know without sending us extra stuff each
-                        // time.
-                        // we cap the number of additional `m`s we tell n about to be at most 10%
-                        // of the `m`s we have to include to avoid excessive overhead.
+                        let remote_state_vector = &self.known[n];
+                        let txn = self.doc.transact();
+                        let diff = ENGINE.encode(&txn.encode_diff_v1(&remote_state_vector));
+                        let state_vector = &txn.state_vector();
+
+                        // Send the update 10% of the time, even if it's the same as the remote state
                         let mut rng = rand::thread_rng();
-                        let additional_cap = (10 * notify_of.len() / 100) as u32;
-                        notify_of.extend(already_known.iter().filter(|_| {
-                            rng.gen_ratio(
-                                additional_cap.min(already_known.len() as u32),
-                                already_known.len() as u32,
-                            )
-                        }));
-                        // eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
-                        if notify_of.is_empty() {
+                        if remote_state_vector == state_vector && !rng.gen_bool(0.1) {
                             continue;
                         }
+                        let state_vector = ENGINE.encode(&state_vector.encode_v1());
+                        eprintln!(
+                            "sending state_vector to {}: {} bytes",
+                            n,
+                            state_vector.len()
+                        );
+                        eprintln!("sending diff to {}: {} bytes", n, diff.len());
                         Message {
                             src: self.node_id.clone(),
                             dst: n.clone(),
                             body: Body {
                                 id: None,
                                 in_reply_to: None,
-                                payload: Payload::Gossip { seen: notify_of },
+                                payload: Payload::Gossip { state_vector, diff },
                             },
                         }
                         .send(&mut *output)
@@ -156,18 +180,19 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             }
         });
 
+        let doc = yrs::Doc::new();
+        let messages = doc.get_or_insert_array("messages");
         Ok(Self {
             msg_id: 1,
             node_id: init.node_id,
-            messages: Default::default(),
+            doc,
+            messages,
             known: init
                 .node_ids
                 .into_iter()
                 .map(|nid| (nid, Default::default()))
                 .collect(),
             neighborhood: Default::default(),
-
-            msg_communicated: Default::default(),
         })
     }
 }

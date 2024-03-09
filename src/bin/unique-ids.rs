@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use vorticity::{main_loop, Event, Message, Node};
+use vorticity::{main_loop, Event, Node};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
