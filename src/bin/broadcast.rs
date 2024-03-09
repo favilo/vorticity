@@ -94,10 +94,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             .send(&mut *output)
                             .context("serialize response to read")?;
                     }
-                    Payload::Topology { mut topology } => {
-                        self.neighborhood = topology
-                            .remove(&self.node_id)
-                            .unwrap_or_else(|| panic!("node {} not in topology", self.node_id));
+                    Payload::Topology { topology: _ } => {
                         reply.body.payload = Payload::TopologyOk;
                         reply
                             .send(&mut *output)
@@ -182,6 +179,13 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
 
         let doc = yrs::Doc::new();
         let messages = doc.get_or_insert_array("messages");
+        let mut rng = rand::thread_rng();
+        let neighborhood = init
+            .node_ids
+            .iter()
+            .cloned()
+            .filter(|_| rng.gen_bool(0.75))
+            .collect();
         Ok(Self {
             msg_id: 1,
             node_id: init.node_id,
@@ -189,10 +193,11 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             messages,
             known: init
                 .node_ids
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|nid| (nid, Default::default()))
                 .collect(),
-            neighborhood: Default::default(),
+            neighborhood,
         })
     }
 }
