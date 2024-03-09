@@ -100,15 +100,21 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             .iter()
                             .copied()
                             .partition(|n| known_to_n.contains(n));
-                        // include a couple extra messages to let them know that we know them
+                        // if we know that n knows m, we don't tell n that _we_ know m, so n will
+                        // send us m for all eternity. So, we include a couple extra m's so they
+                        // gradually know all the m's we know without sending us extra stuff each
+                        // time.
+                        // we cap the number of additional `m`s we tell n about to be at most 10%
+                        // of the `m`s we have to include to avoid excessive overhead.
                         let mut rng = rand::thread_rng();
+                        let additional_cap = (10 * notify_of.len() / 100) as u32;
                         notify_of.extend(already_known.iter().filter(|_| {
                             rng.gen_ratio(
-                                10.min(already_known.len() as u32),
+                                additional_cap.min(already_known.len() as u32),
                                 already_known.len() as u32,
                             )
                         }));
-                        eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
+                        // eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
                         Message {
                             src: self.node_id.clone(),
                             dst: n.clone(),
