@@ -8,28 +8,11 @@ use vorticity::{main_loop, Body, Message, Node};
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Payload {
-    Init(vorticity::Init),
-    InitOk,
-
     Generate,
-
     GenerateOk {
         #[serde(rename = "id")]
         guid: String,
     },
-}
-
-impl vorticity::Payload for Payload {
-    fn extract_init(input: Self) -> Option<vorticity::Init> {
-        let Payload::Init(init) = input else {
-            return None;
-        };
-        Some(init)
-    }
-
-    fn gen_init_ok() -> Self {
-        Self::InitOk
-    }
 }
 
 pub struct UniqueNode {
@@ -56,8 +39,6 @@ impl Node<(), Payload> for UniqueNode {
                     .context("serialize response to generate")?;
                 output.write_all(b"\n").context("write newline to output")?;
             }
-            Payload::Init { .. } => bail!("init should already be handled"),
-            Payload::InitOk => bail!("Unexpected InitOk message"),
             Payload::GenerateOk { .. } => bail!("Unexpected GenerateOk message"),
         }
         self.msg_id += 1;
