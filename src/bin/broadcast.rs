@@ -115,6 +115,9 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             )
                         }));
                         // eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
+                        if notify_of.is_empty() {
+                            continue;
+                        }
                         Message {
                             src: self.node_id.clone(),
                             dst: n.clone(),
