@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use vorticity::{main_loop, Body, Event, Message, Node};
 
@@ -79,7 +80,13 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             .send(&mut *output)
                             .context("serialize response to topology")?;
                     }
-                    Payload::Gossip { seen } => self.messages.extend(seen),
+                    Payload::Gossip { seen } => {
+                        self.known
+                            .get_mut(&reply.dst)
+                            .expect("got gossip from unknown node")
+                            .extend(seen.iter().copied());
+                        self.messages.extend(seen);
+                    }
                     Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
                 }
             }
@@ -88,20 +95,27 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 InjectedPayload::Gossip => {
                     for n in &self.neighborhood {
                         let known_to_n = &self.known[n];
+                        let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = self
+                            .messages
+                            .iter()
+                            .copied()
+                            .partition(|n| known_to_n.contains(n));
+                        // include a couple extra messages to let them know that we know them
+                        let mut rng = rand::thread_rng();
+                        notify_of.extend(already_known.iter().filter(|_| {
+                            rng.gen_ratio(
+                                10.min(already_known.len() as u32),
+                                already_known.len() as u32,
+                            )
+                        }));
+                        eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
                         Message {
                             src: self.node_id.clone(),
                             dst: n.clone(),
                             body: Body {
                                 id: None,
                                 in_reply_to: None,
-                                payload: Payload::Gossip {
-                                    seen: self
-                                        .messages
-                                        .iter()
-                                        .copied()
-                                        .filter(|n| !known_to_n.contains(n))
-                                        .collect(),
-                                },
+                                payload: Payload::Gossip { seen: notify_of },
                             },
                         }
                         .send(&mut *output)
