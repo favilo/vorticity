@@ -1,11 +1,8 @@
-use std::{
-    io::{StdoutLock, Write},
-    sync::mpsc::Sender,
-};
+use std::sync::mpsc::Sender;
 
-use anyhow::Context;
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use vorticity::{main_loop, Event, Node};
+use vorticity::{Context, Event, Node, Runtime, ToEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -20,7 +17,7 @@ pub struct EchoNode {
 }
 
 impl Node<(), Payload> for EchoNode {
-    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, ctx: Context) -> anyhow::Result<()> {
         let Event::Message(input) = input else {
             unreachable!()
         };
@@ -28,9 +25,7 @@ impl Node<(), Payload> for EchoNode {
         match reply.body.payload {
             Payload::Echo { echo } => {
                 reply.body.payload = Payload::EchoOk { echo };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to echo")?;
-                output.write_all(b"\n").context("write newline to output")?;
+                ctx.send(reply).context("serialize response to echo")?;
             }
             Payload::EchoOk { .. } => {}
         }
@@ -38,11 +33,7 @@ impl Node<(), Payload> for EchoNode {
         Ok(())
     }
 
-    fn from_init(
-        _state: (),
-        _init: vorticity::Init,
-        _tx: Sender<Event<Payload>>,
-    ) -> anyhow::Result<Self>
+    fn from_init(_state: (), _init: vorticity::Init, _tx: Sender<ToEvent>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -50,6 +41,7 @@ impl Node<(), Payload> for EchoNode {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    main_loop::<_, EchoNode, _, _>(())
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    Runtime::<_, _, _, EchoNode>::run(()).await
 }

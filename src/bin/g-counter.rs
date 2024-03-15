@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::mpsc::Sender,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::mpsc::Sender, time::Duration};
 
 use anyhow::Context as _;
 use base64::{
@@ -14,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use vorticity::{Body, Context, Event, Message, Node, Runtime, ToEvent};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
-    Array, ReadTxn, Transact,
+    Map, ReadTxn, Transact,
 };
 
 const ENGINE: GeneralPurpose =
@@ -24,23 +20,13 @@ const ENGINE: GeneralPurpose =
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Payload {
-    Broadcast {
-        message: usize,
-    },
-    BroadcastOk,
-    Read,
-    ReadOk {
-        messages: HashSet<usize>,
-    },
-    Topology {
-        topology: HashMap<String, Vec<String>>,
-    },
-    TopologyOk,
+    Add { delta: u64 },
+    AddOk,
 
-    Gossip {
-        diff: String,
-        state_vector: String,
-    },
+    Read,
+    ReadOk { value: u64 },
+
+    Gossip { diff: String, state_vector: String },
 }
 
 #[derive(Debug, Clone)]
@@ -48,48 +34,55 @@ enum InjectedPayload {
     Gossip,
 }
 
-pub struct BroadcastNode {
+pub struct GCounterNode {
     msg_id: usize,
     node_id: String,
     doc: yrs::Doc,
-    messages: yrs::ArrayRef,
+    counter: yrs::MapRef,
     known: HashMap<String, yrs::StateVector>,
     neighborhood: Vec<String>,
 }
 
-impl Node<(), Payload, InjectedPayload> for BroadcastNode {
+impl Node<(), Payload, InjectedPayload> for GCounterNode {
     fn step(&mut self, input: Event<Payload, InjectedPayload>, ctx: Context) -> anyhow::Result<()> {
         match input {
             Event::Message(input) => {
                 let mut reply = input.into_reply(Some(&mut self.msg_id));
                 match reply.body.payload {
-                    Payload::Broadcast { message } => {
+                    Payload::Add { delta } => {
                         let mut txn = self.doc.transact_mut();
-                        self.messages.push_back(&mut txn, message as i64);
+                        let old_val = self
+                            .counter
+                            .get(&txn, &self.doc.client_id().to_string())
+                            .unwrap_or(yrs::Value::Any(0.into()))
+                            .cast::<i64>()
+                            .unwrap();
+                        self.counter.insert(
+                            &mut txn,
+                            self.doc.client_id().to_string(),
+                            old_val + delta as i64,
+                        );
 
-                        reply.body.payload = Payload::BroadcastOk;
+                        reply.body.payload = Payload::AddOk;
                         ctx.send(reply).context("serialize response to broadcast")?;
                     }
                     Payload::Read => {
                         let txn = self.doc.transact();
-                        let messages = self
-                            .messages
+                        let value = self
+                            .counter
                             .iter(&txn)
-                            .map(|v| {
+                            .map(|(_, v)| -> u64 {
                                 v.cast::<i64>()
                                     .expect("Not an integer")
                                     .try_into()
                                     .expect("all messages should be positive")
                             })
-                            .collect();
+                            .sum();
 
-                        reply.body.payload = Payload::ReadOk { messages };
+                        reply.body.payload = Payload::ReadOk { value };
                         ctx.send(reply).context("serialize response to read")?;
                     }
-                    Payload::Topology { topology: _ } => {
-                        reply.body.payload = Payload::TopologyOk;
-                        ctx.send(reply).context("serialize response to topology")?;
-                    }
+
                     Payload::Gossip { state_vector, diff } => {
                         let state_vector = yrs::StateVector::decode_v1(
                             &ENGINE
@@ -105,7 +98,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         let mut txn = self.doc.transact_mut();
                         txn.apply_update(update);
                     }
-                    Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
+                    Payload::AddOk | Payload::ReadOk { .. } => {}
                 }
             }
             Event::Eof => {}
@@ -129,7 +122,6 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             state_vector.len()
                         );
                         eprintln!("sending diff to {}: {} bytes", n, diff.len());
-
                         ctx.send(Message {
                             src: self.node_id.clone(),
                             dst: n.clone(),
@@ -168,7 +160,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         });
 
         let doc = yrs::Doc::new();
-        let messages = doc.get_or_insert_array("messages");
+        let counter = doc.get_or_insert_map("counter");
         let mut rng = rand::thread_rng();
         let neighborhood = init
             .node_ids
@@ -180,7 +172,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             msg_id: 1,
             node_id: init.node_id,
             doc,
-            messages,
+            counter,
             known: init
                 .node_ids
                 .iter()
@@ -194,5 +186,5 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    Runtime::<_, Payload, InjectedPayload, BroadcastNode>::run(()).await
+    Runtime::<_, Payload, InjectedPayload, GCounterNode>::run(()).await
 }

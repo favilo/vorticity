@@ -1,86 +1,38 @@
 use std::{
-    io::{BufRead, StdoutLock, Write},
-    sync::mpsc::Sender,
+    any::TypeId,
+    cell::{OnceCell, RefCell},
+    collections::HashMap,
+    io::{BufRead, Lines, StdinLock, Stdout, StdoutLock, Write},
+    marker::PhantomData,
+    rc::Rc,
+    sync::{
+        atomic::AtomicU64,
+        mpsc::{Receiver, Sender},
+        Arc,
+    },
     thread,
 };
 
-use anyhow::Context;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use anyhow::Context as _;
+use serde::{de::DeserializeOwned, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message<Payload> {
-    pub src: String,
+use message::InitPayload;
+pub use message::{Body, Event, Init, Message};
+use tokio::sync::{Mutex, RwLock};
 
-    #[serde(rename = "dest")]
-    pub dst: String,
+pub mod message;
+pub mod rpc;
 
-    pub body: Body<Payload>,
-}
-
-impl<Payload> Message<Payload> {
-    pub fn into_reply(self, id: Option<&mut usize>) -> Self {
-        Self {
-            src: self.dst,
-            dst: self.src,
-            body: Body {
-                id: id.map(|id| {
-                    let mid = *id;
-                    *id += 1;
-                    mid
-                }),
-                in_reply_to: self.body.id,
-                payload: self.body.payload,
-            },
-        }
-    }
-
-    pub fn send(&self, output: &mut impl Write) -> anyhow::Result<()>
-    where
-        Payload: Serialize,
-    {
-        serde_json::to_writer(&mut *output, self).context("serialize message to send")?;
-        output.write_all(b"\n").context("write newline to output")?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Event<Payload, InjectedPayload = ()> {
-    Message(Message<Payload>),
-    Injected(InjectedPayload),
-    Eof,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Body<Payload> {
-    #[serde(rename = "msg_id")]
-    pub id: Option<usize>,
-
-    pub in_reply_to: Option<usize>,
-
-    #[serde(flatten)]
-    pub payload: Payload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum InitPayload {
-    Init(Init),
-    InitOk,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Init {
-    pub node_id: String,
-    pub node_ids: Vec<String>,
+pub trait Handler {
+    fn can_handle(&self, json: &serde_json::Value) -> bool;
+    fn step(&mut self, json: serde_json::Value, ctx: Context) -> anyhow::Result<()>;
 }
 
 pub trait Node<S, Payload, InjectedPayload = ()> {
     fn from_init(
         state: S,
         init: Init,
-        inject: Sender<Event<Payload, InjectedPayload>>,
+        inject: Sender<ToEvent<InjectedPayload>>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -88,74 +40,177 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
     fn step(
         &mut self,
         input: Event<Payload, InjectedPayload>,
-        output: &mut StdoutLock,
+        output: Context,
     ) -> anyhow::Result<()>;
 }
 
-pub fn main_loop<S, N, P, IP>(init_state: S) -> anyhow::Result<()>
+pub enum ToEvent<InjectedPayload = ()> {
+    Message(serde_json::Value),
+    Injected(InjectedPayload),
+    Eof,
+}
+
+impl<IP> ToEvent<IP> {
+    pub fn to_event<Payload>(&self) -> anyhow::Result<Event<Payload, IP>>
+    where
+        Payload: DeserializeOwned,
+        IP: Clone,
+    {
+        match self {
+            ToEvent::Message(e) => Ok(Event::Message(serde_json::from_value(e.clone())?)),
+            ToEvent::Injected(i) => Ok(Event::Injected(i.clone())),
+            ToEvent::Eof => Ok(Event::Eof),
+        }
+    }
+}
+
+pub struct RpcRegistry {
+    registry: HashMap<TypeId, Box<dyn Handler>>,
+}
+
+#[derive(Clone)]
+pub struct Context<'a> {
+    stdout: Rc<RefCell<StdoutLock<'a>>>,
+    registry: Rc<RefCell<RpcRegistry>>,
+}
+
+impl Context<'_> {
+    pub fn send<S>(&self, s: S) -> anyhow::Result<()>
+    where
+        S: Serialize,
+    {
+        let mut stdout = self.stdout.borrow_mut();
+        serde_json::to_writer(&mut *stdout, &s).context("serialize message to send")?;
+        (&mut stdout)
+            .write_all(b"\n")
+            .context("write newline to output")?;
+        Ok(())
+    }
+}
+
+pub struct Runtime<S, P, IP, N>
+where
+    N: Node<S, P, IP>,
+{
+    /// The current msg_id to use for the next message
+    msg_id: Arc<AtomicU64>,
+
+    /// The stdout to use for sending messages
+    stdout: Arc<Mutex<Stdout>>,
+
+    /// The node to use to handle messages
+    handler: Arc<N>,
+
+    node_state: RwLock<NodeState>,
+
+    /// Need to keep track of types, but don't need to use them outside of N
+    _phantom: PhantomData<(S, P, IP)>,
+}
+
+impl<S, P, IP, N> Runtime<S, P, IP, N>
 where
     P: DeserializeOwned + Send + 'static,
     N: Node<S, P, IP>,
-    IP: Send + 'static,
+    IP: Clone + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
+    pub async fn run(init_state: S) -> anyhow::Result<()> {
+        let (tx, rx): (Sender<ToEvent<IP>>, Receiver<ToEvent<IP>>) = std::sync::mpsc::channel();
 
-    let stdin = std::io::stdin().lock();
-    let mut stdin = stdin.lines();
-    let mut stdout = std::io::stdout().lock();
-
-    let init_msg: Message<InitPayload> = serde_json::from_str::<Message<InitPayload>>(
-        &stdin
-            .next()
-            .expect("no init message received")
-            .context("failed to read init message from stdin")?,
-    )
-    .context("read init message from STDIN")?;
-
-    let InitPayload::Init(init) = init_msg.body.payload else {
-        panic!("first message should be init")
-    };
-    let mut node =
-        N::from_init(init_state, init, tx.clone()).context("node initialization failed")?;
-
-    let reply = Message {
-        src: init_msg.dst,
-        dst: init_msg.src,
-        body: Body {
-            id: Some(0),
-            in_reply_to: init_msg.body.id,
-            payload: InitPayload::InitOk,
-        },
-    };
-    serde_json::to_writer(&mut stdout, &reply).context("serialize response to init")?;
-    stdout.write_all(b"\n").context("write newline to output")?;
-
-    let stdin_tx = tx.clone();
-    drop(stdin);
-    let handle = thread::spawn(move || {
         let stdin = std::io::stdin().lock();
-        for line in stdin.lines() {
-            let line = line.context("Maestrom input from STDIN could not be deserialized")?;
-            let input = serde_json::from_str::<Message<P>>(&line)
-                .context("read input message from STDIN")?;
-            if let Err(_) = stdin_tx.send(Event::Message(input)) {
-                break;
+        let mut stdin = stdin.lines();
+        let mut stdout = std::io::stdout().lock();
+
+        let mut node: N = Self::init_node(&mut stdin, init_state, &tx, &mut stdout)?;
+
+        let stdin_tx = tx.clone();
+        drop(stdin);
+        let handle = thread::spawn(move || {
+            let stdin = std::io::stdin().lock();
+            for line in stdin.lines() {
+                let line = line.context("Maestrom input from STDIN could not be deserialized")?;
+                let input = serde_json::from_str::<serde_json::Value>(&line)
+                    .context("read input message from STDIN")?;
+                if let Err(_) = stdin_tx.send(ToEvent::Message(input)) {
+                    break;
+                }
+            }
+            let _ = tx.send(ToEvent::Eof);
+
+            Ok::<_, anyhow::Error>(())
+        });
+        let stdout = Rc::new(RefCell::new(stdout));
+        let registry = Rc::new(RefCell::new(RpcRegistry {
+            registry: HashMap::new(),
+        }));
+        let context = Context {
+            registry: registry.clone(),
+            stdout,
+        };
+
+        for input in rx {
+            if let Ok(input) = input.to_event() {
+                node.step(input, context.clone())
+                    .context("Node step function failed")?;
+            } else {
+                let ToEvent::Message(message) = input else {
+                    panic!("Impossible position");
+                };
+
+                // TODO: problem, how can I prevent registry from getting accessed in rpc handlers?
+                for handler in registry.borrow_mut().registry.values_mut() {
+                    if handler.can_handle(&message) {
+                        handler
+                            .step(message, context.clone())
+                            .context("RpcHandler failed")?;
+                        break;
+                    }
+                }
             }
         }
-        let _ = tx.send(Event::Eof);
 
-        Ok::<_, anyhow::Error>(())
-    });
+        handle
+            .join()
+            .expect("failed to join input thread")
+            .context("error from stdin thread")?;
 
-    for input in rx {
-        node.step(input, &mut stdout)
-            .context("Node step function failed")?;
+        Ok(())
     }
 
-    handle
-        .join()
-        .expect("failed to join input thread")
-        .context("error from stdin thread")?;
+    fn init_node(
+        stdin: &mut Lines<StdinLock>,
+        init_state: S,
+        tx: &Sender<ToEvent<IP>>,
+        stdout: &mut StdoutLock,
+    ) -> Result<N, anyhow::Error> {
+        let init_msg: Message<InitPayload> = serde_json::from_str::<Message<InitPayload>>(
+            &stdin
+                .next()
+                .expect("no init message received")
+                .context("failed to read init message from stdin")?,
+        )
+        .context("read init message from STDIN")?;
+        let InitPayload::Init(init) = init_msg.body.payload else {
+            panic!("first message should be init")
+        };
+        let node =
+            N::from_init(init_state, init, tx.clone()).context("node initialization failed")?;
+        let reply = Message {
+            src: init_msg.dst,
+            dst: init_msg.src,
+            body: Body {
+                id: Some(0),
+                in_reply_to: init_msg.body.id,
+                payload: InitPayload::InitOk,
+            },
+        };
+        serde_json::to_writer(&mut *stdout, &reply).context("serialize response to init")?;
+        stdout.write_all(b"\n").context("write newline to output")?;
+        Ok(node)
+    }
+}
 
-    Ok(())
+#[derive(Debug, Clone, Default)]
+pub struct NodeState {
+    pub node_id: String,
+    pub nodes: Vec<String>,
 }
