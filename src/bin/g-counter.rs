@@ -184,7 +184,6 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Runtime::<_, Payload, InjectedPayload, GCounterNode>::run(()).await
+fn main() -> anyhow::Result<()> {
+    Runtime::run::<_, Payload, InjectedPayload, GCounterNode>(())
 }

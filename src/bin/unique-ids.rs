@@ -50,7 +50,6 @@ impl Node<(), Payload> for UniqueNode {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Ok(Runtime::<_, _, _, UniqueNode>::run(()).await?)
+fn main() -> anyhow::Result<()> {
+    Runtime::run::<_, _, _, UniqueNode>(())
 }

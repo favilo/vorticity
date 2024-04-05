@@ -20,7 +20,7 @@ struct CallbackData<Payload> {
 
 impl<Payload> Handler for RpcHandler<Payload>
 where
-    Payload: Serialize + DeserializeOwned,
+    Payload: Serialize + DeserializeOwned + Sync + Send + 'static,
 {
     fn can_handle(&self, json: &serde_json::Value) -> bool {
         serde_json::from_value::<Message<Payload>>(json.clone()).is_ok()
@@ -37,7 +37,7 @@ where
         };
         let reply = (callback.callback)(callback.reply_to, input.body.payload);
         if let Some(reply) = reply {
-            ctx.send(&reply)
+            ctx.send(reply)
                 .context("Sending response RPC from handler")?;
         }
 

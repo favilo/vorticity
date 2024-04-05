@@ -41,7 +41,6 @@ impl Node<(), Payload> for EchoNode {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Runtime::<_, _, _, EchoNode>::run(()).await
+fn main() -> anyhow::Result<()> {
+    Runtime::run::<_, _, _, EchoNode>(())
 }

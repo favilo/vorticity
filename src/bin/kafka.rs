@@ -289,7 +289,6 @@ impl KafkaNode {
 
 impl KafkaNode {}
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Runtime::<_, Payload, InjectedPayload, KafkaNode>::run(()).await
+fn main() -> anyhow::Result<()> {
+    Runtime::run::<_, Payload, InjectedPayload, KafkaNode>(())
 }

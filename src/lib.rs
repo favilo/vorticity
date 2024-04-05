@@ -8,17 +8,17 @@ use std::{
     sync::{
         atomic::AtomicU64,
         mpsc::{Receiver, Sender},
-        Arc,
+        Arc, Mutex, RwLock,
     },
     thread,
 };
 
 use anyhow::Context as _;
-use serde::{de::DeserializeOwned, Serialize};
 
+use erased_serde::Serialize;
 use message::InitPayload;
 pub use message::{Body, Event, Init, Message};
-use tokio::sync::{Mutex, RwLock};
+use serde::{de::DeserializeOwned, Deserialize};
 
 pub mod message;
 pub mod rpc;
@@ -69,119 +69,78 @@ pub struct RpcRegistry {
 }
 
 #[derive(Clone)]
-pub struct Context<'a> {
-    stdout: Rc<RefCell<StdoutLock<'a>>>,
+pub struct Context {
+    msg_out_tx: Sender<Box<dyn Serialize + Send + Sync + 'static>>,
     registry: Rc<RefCell<RpcRegistry>>,
 }
 
-impl Context<'_> {
+impl Context {
     pub fn send<S>(&self, s: S) -> anyhow::Result<()>
     where
-        S: Serialize,
+        S: Serialize + Sync + Send + 'static,
     {
-        let mut stdout = self.stdout.borrow_mut();
-        serde_json::to_writer(&mut *stdout, &s).context("serialize message to send")?;
-        (&mut stdout)
-            .write_all(b"\n")
-            .context("write newline to output")?;
+        self.msg_out_tx
+            .send(Box::new(s))
+            .context("send message to stdout")?;
         Ok(())
     }
 }
 
-pub struct Runtime<S, P, IP, N>
-where
-    N: Node<S, P, IP>,
-{
-    /// The current msg_id to use for the next message
-    msg_id: Arc<AtomicU64>,
+pub struct Runtime;
 
-    /// The stdout to use for sending messages
-    stdout: Arc<Mutex<Stdout>>,
+impl Runtime {
+    pub fn run<S, P, IP, N>(init_state: S) -> anyhow::Result<()>
+    where
+        P: DeserializeOwned + Send + 'static,
+        N: Node<S, P, IP>,
+        IP: Clone + Send + 'static,
+    {
+        let (msg_in_tx, msg_in_rx): (Sender<ToEvent<IP>>, Receiver<ToEvent<IP>>) =
+            std::sync::mpsc::channel();
 
-    /// The node to use to handle messages
-    handler: Arc<N>,
+        let (msg_out_tx, msg_out_rx) = std::sync::mpsc::channel();
 
-    node_state: RwLock<NodeState>,
+        let node: N = Self::init_node(init_state, &msg_in_tx, msg_out_tx.clone())?;
+        let node = node;
 
-    /// Need to keep track of types, but don't need to use them outside of N
-    _phantom: PhantomData<(S, P, IP)>,
-}
+        let stdin_tx = msg_in_tx.clone();
+        let input_handle = receive_loop::<N, S, P, IP>(stdin_tx, msg_in_tx);
 
-impl<S, P, IP, N> Runtime<S, P, IP, N>
-where
-    P: DeserializeOwned + Send + 'static,
-    N: Node<S, P, IP>,
-    IP: Clone + Send + 'static,
-{
-    pub async fn run(init_state: S) -> anyhow::Result<()> {
-        let (tx, rx): (Sender<ToEvent<IP>>, Receiver<ToEvent<IP>>) = std::sync::mpsc::channel();
-
-        let stdin = std::io::stdin().lock();
-        let mut stdin = stdin.lines();
-        let mut stdout = std::io::stdout().lock();
-
-        let mut node: N = Self::init_node(&mut stdin, init_state, &tx, &mut stdout)?;
-
-        let stdin_tx = tx.clone();
-        drop(stdin);
-        let handle = thread::spawn(move || {
-            let stdin = std::io::stdin().lock();
-            for line in stdin.lines() {
-                let line = line.context("Maestrom input from STDIN could not be deserialized")?;
-                let input = serde_json::from_str::<serde_json::Value>(&line)
-                    .context("read input message from STDIN")?;
-                if let Err(_) = stdin_tx.send(ToEvent::Message(input)) {
-                    break;
-                }
-            }
-            let _ = tx.send(ToEvent::Eof);
-
-            Ok::<_, anyhow::Error>(())
-        });
-        let stdout = Rc::new(RefCell::new(stdout));
+        let output_handle = send_loop::<N, S, P, IP>(msg_out_rx);
         let registry = Rc::new(RefCell::new(RpcRegistry {
             registry: HashMap::new(),
         }));
         let context = Context {
             registry: registry.clone(),
-            stdout,
+            msg_out_tx: msg_out_tx.clone(),
         };
 
-        for input in rx {
-            if let Ok(input) = input.to_event() {
-                node.step(input, context.clone())
-                    .context("Node step function failed")?;
-            } else {
-                let ToEvent::Message(message) = input else {
-                    panic!("Impossible position");
-                };
+        event_loop(msg_in_rx, node, context, registry)?;
 
-                // TODO: problem, how can I prevent registry from getting accessed in rpc handlers?
-                for handler in registry.borrow_mut().registry.values_mut() {
-                    if handler.can_handle(&message) {
-                        handler
-                            .step(message, context.clone())
-                            .context("RpcHandler failed")?;
-                        break;
-                    }
-                }
-            }
-        }
-
-        handle
+        input_handle
             .join()
             .expect("failed to join input thread")
             .context("error from stdin thread")?;
+        output_handle
+            .join()
+            .expect("failed to join output thread")
+            .context("error from stdout thread")?;
 
         Ok(())
     }
 
-    fn init_node(
-        stdin: &mut Lines<StdinLock>,
+    fn init_node<S, P, IP, N>(
         init_state: S,
         tx: &Sender<ToEvent<IP>>,
-        stdout: &mut StdoutLock,
-    ) -> Result<N, anyhow::Error> {
+        msg_out_tx: Sender<Box<dyn Serialize + Send + Sync + 'static>>,
+    ) -> Result<N, anyhow::Error>
+    where
+        P: DeserializeOwned + Send + 'static,
+        N: Node<S, P, IP>,
+        IP: Clone + Send + 'static,
+    {
+        let stdin = std::io::stdin().lock();
+        let mut stdin = stdin.lines();
         let init_msg: Message<InitPayload> = serde_json::from_str::<Message<InitPayload>>(
             &stdin
                 .next()
@@ -203,10 +162,89 @@ where
                 payload: InitPayload::InitOk,
             },
         };
-        serde_json::to_writer(&mut *stdout, &reply).context("serialize response to init")?;
-        stdout.write_all(b"\n").context("write newline to output")?;
+        msg_out_tx
+            .send(Box::new(reply))
+            .context("send init reply to stdout")?;
         Ok(node)
     }
+}
+
+fn event_loop<N, S, P, IP>(
+    msg_in_rx: Receiver<ToEvent<IP>>,
+    mut node: N,
+    context: Context,
+    registry: Rc<RefCell<RpcRegistry>>,
+) -> Result<(), anyhow::Error>
+where
+    N: Node<S, P, IP>,
+    P: for<'de> Deserialize<'de> + Send + 'static,
+    IP: Clone + Send + 'static,
+{
+    for input in msg_in_rx {
+        if let Ok(input) = input.to_event() {
+            node.step(input, context.clone())
+                .context("Node step function failed")?;
+        } else {
+            let ToEvent::Message(message) = input else {
+                panic!("Impossible position");
+            };
+
+            // TODO: problem, how can I prevent registry from getting accessed in rpc handlers?
+            for handler in registry.borrow_mut().registry.values_mut() {
+                if handler.can_handle(&message) {
+                    handler
+                        .step(message, context.clone())
+                        .context("RpcHandler failed")?;
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn receive_loop<N, S, P, IP>(
+    stdin_tx: Sender<ToEvent<IP>>,
+    msg_in_tx: Sender<ToEvent<IP>>,
+) -> thread::JoinHandle<Result<(), anyhow::Error>>
+where
+    N: Node<S, P, IP>,
+    IP: Clone + Send + 'static,
+{
+    let input_handle = thread::spawn(move || {
+        let stdin = std::io::stdin().lock();
+        for line in stdin.lines() {
+            let line = line.context("Maestrom input from STDIN could not be deserialized")?;
+            let input = serde_json::from_str::<serde_json::Value>(&line)
+                .context("read input message from STDIN")?;
+            if let Err(_) = stdin_tx.send(ToEvent::Message(input)) {
+                break;
+            }
+        }
+        let _ = msg_in_tx.send(ToEvent::Eof);
+
+        Ok::<_, anyhow::Error>(())
+    });
+    input_handle
+}
+
+fn send_loop<N, S, P, IP>(
+    msg_out_rx: Receiver<Box<dyn Serialize + Send + Sync>>,
+) -> thread::JoinHandle<Result<(), anyhow::Error>>
+where
+    N: Node<S, P, IP>,
+    IP: Clone + Send + 'static,
+{
+    let output_handle = thread::spawn(move || {
+        let mut stdout = std::io::stdout().lock();
+        for send_msg in msg_out_rx {
+            serde_json::to_writer(&mut stdout, &send_msg).context("serialize response to init")?;
+            stdout.write_all(b"\n").context("write newline to output")?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    output_handle
 }
 
 #[derive(Debug, Clone, Default)]

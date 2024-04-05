@@ -192,7 +192,6 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Runtime::<_, Payload, InjectedPayload, BroadcastNode>::run(()).await
+fn main() -> anyhow::Result<()> {
+    Runtime::run::<_, Payload, InjectedPayload, BroadcastNode>(())
 }
