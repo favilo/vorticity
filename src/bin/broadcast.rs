@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::mpsc::Sender,
     time::Duration,
 };
 
@@ -11,7 +10,7 @@ use base64::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Body, Context, Event, Message, Node, Runtime, ToEvent};
+use vorticity::{Body, Context, Event, Message, Node, Runtime};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     Array, ReadTxn, Transact,
@@ -58,7 +57,11 @@ pub struct BroadcastNode {
 }
 
 impl Node<(), Payload, InjectedPayload> for BroadcastNode {
-    fn step(&mut self, input: Event<Payload, InjectedPayload>, ctx: Context) -> anyhow::Result<()> {
+    fn step(
+        &mut self,
+        input: Event<Payload, InjectedPayload>,
+        ctx: Context<InjectedPayload>,
+    ) -> anyhow::Result<()> {
         match input {
             Event::Message(input) => {
                 let mut reply = input.into_reply(Some(&mut self.msg_id));
@@ -143,6 +146,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     }
                 }
             },
+            Event::Reply(_) => todo!(),
         }
 
         Ok(())
@@ -151,7 +155,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
     fn from_init(
         _state: (),
         init: vorticity::Init,
-        tx: Sender<ToEvent<InjectedPayload>>,
+        context: Context<InjectedPayload>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -161,7 +165,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             // TODO: handle EOF signal
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                if let Err(_) = tx.send(ToEvent::Injected(InjectedPayload::Gossip)) {
+                if let Err(_) = context.inject(InjectedPayload::Gossip) {
                     break;
                 }
             }

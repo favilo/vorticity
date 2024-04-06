@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::mpsc::Sender, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Context as _;
 use base64::{
@@ -7,14 +7,14 @@ use base64::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Body, Context, Event, Message, Node, Runtime, ToEvent};
+use vorticity::{Body, Context, Event, Message, Node, Runtime};
 use yrs::{
     types::ToJson,
     updates::{decoder::Decode, encoder::Encode},
     Array, ArrayPrelim, ArrayRef, Map, ReadTxn, Transact, Value,
 };
 
-mod kafka_lib;
+// mod kafka_lib;
 
 const ENGINE: GeneralPurpose =
     GeneralPurpose::new(&base64::alphabet::URL_SAFE, GeneralPurposeConfig::new());
@@ -56,7 +56,6 @@ enum Payload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum AdminPayload {
     Gossip { diff: String, state_vector: String },
@@ -75,11 +74,14 @@ pub struct KafkaNode {
     offsets: yrs::MapRef,
     known: HashMap<String, yrs::StateVector>,
     neighborhood: Vec<String>,
-    event_sender: Sender<ToEvent<InjectedPayload>>,
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
-    fn step(&mut self, input: Event<Payload, InjectedPayload>, ctx: Context) -> anyhow::Result<()> {
+    fn step(
+        &mut self,
+        input: Event<Payload, InjectedPayload>,
+        ctx: Context<InjectedPayload>,
+    ) -> anyhow::Result<()> {
         match input {
             Event::Message(input) => {
                 let mut reply = input.into_reply(Some(&mut self.msg_id));
@@ -167,6 +169,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             Event::Injected(input) => {
                 self.handle_injected(input, &ctx)?;
             }
+            Event::Reply(_) => todo!(),
         }
 
         Ok(())
@@ -175,18 +178,17 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
     fn from_init(
         _state: (),
         init: vorticity::message::Init,
-        tx: Sender<ToEvent<InjectedPayload>>,
+        context: Context<InjectedPayload>,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
-        let gossip_tx = tx.clone();
         std::thread::spawn(move || {
             // generate gossip events
             // TODO: handle EOF signal
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                if let Err(_) = gossip_tx.send(ToEvent::Injected(InjectedPayload::Gossip)) {
+                if let Err(_) = context.inject(InjectedPayload::Gossip) {
                     break;
                 }
             }
@@ -208,7 +210,6 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             doc,
             logs,
             offsets,
-            event_sender: tx,
             known: init
                 .node_ids
                 .iter()
@@ -221,10 +222,17 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
 }
 
 impl KafkaNode {
-    fn handle_injected(&mut self, input: InjectedPayload, ctx: &Context) -> anyhow::Result<()> {
+    fn handle_injected(
+        &mut self,
+        input: InjectedPayload,
+        ctx: &Context<InjectedPayload>,
+    ) -> anyhow::Result<()> {
         match input {
             InjectedPayload::Gossip => {
                 for n in &self.neighborhood {
+                    if n == &self.node_id {
+                        continue;
+                    }
                     let remote_state_vector = &self.known[n];
                     let txn = self.doc.transact();
                     let diff = ENGINE.encode(&txn.encode_diff_v1(&remote_state_vector));
@@ -261,7 +269,7 @@ impl KafkaNode {
     fn handle_admin(
         &mut self,
         reply: &mut Message<Payload>,
-        _output: &Context,
+        _output: &Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
         let Payload::Admin(admin_payload) = &reply.body.payload else {
             anyhow::bail!("expected Admin payload");

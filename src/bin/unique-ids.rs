@@ -1,8 +1,6 @@
-use std::sync::mpsc::Sender;
-
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use vorticity::{Context, Event, Node, Runtime, ToEvent};
+use vorticity::{Context, Event, Node, Runtime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -21,7 +19,7 @@ pub struct UniqueNode {
 }
 
 impl Node<(), Payload> for UniqueNode {
-    fn step(&mut self, input: Event<Payload>, ctx: Context) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, ctx: Context<()>) -> anyhow::Result<()> {
         let Event::Message(input) = input else {
             unreachable!();
         };
@@ -39,7 +37,7 @@ impl Node<(), Payload> for UniqueNode {
         Ok(())
     }
 
-    fn from_init(_state: (), init: vorticity::Init, _tx: Sender<ToEvent>) -> anyhow::Result<Self>
+    fn from_init(_state: (), init: vorticity::Init, _ctx: Context<()>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {

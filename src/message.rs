@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message<Payload> {
@@ -32,6 +33,7 @@ impl<Payload> Message<Payload> {
 pub enum Event<Payload, InjectedPayload = ()> {
     Message(Message<Payload>),
     Injected(InjectedPayload),
+    Reply(Message<Value>),
     Eof,
 }
 

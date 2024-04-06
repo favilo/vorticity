@@ -1,15 +1,6 @@
 use std::{
-    any::TypeId,
-    cell::{OnceCell, RefCell},
-    collections::HashMap,
-    io::{BufRead, Lines, StdinLock, Stdout, StdoutLock, Write},
-    marker::PhantomData,
-    rc::Rc,
-    sync::{
-        atomic::AtomicU64,
-        mpsc::{Receiver, Sender},
-        Arc, Mutex, RwLock,
-    },
+    io::{BufRead, Write},
+    sync::mpsc::{Receiver, Sender},
     thread,
 };
 
@@ -21,31 +12,27 @@ pub use message::{Body, Event, Init, Message};
 use serde::{de::DeserializeOwned, Deserialize};
 
 pub mod message;
-pub mod rpc;
+// pub mod rpc;
 
-pub trait Handler {
+pub trait Handler<IP> {
     fn can_handle(&self, json: &serde_json::Value) -> bool;
-    fn step(&mut self, json: serde_json::Value, ctx: Context) -> anyhow::Result<()>;
+    fn step(&mut self, json: serde_json::Value, ctx: Context<IP>) -> anyhow::Result<()>;
 }
 
 pub trait Node<S, Payload, InjectedPayload = ()> {
-    fn from_init(
-        state: S,
-        init: Init,
-        inject: Sender<ToEvent<InjectedPayload>>,
-    ) -> anyhow::Result<Self>
+    fn from_init(state: S, init: Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
     where
         Self: Sized;
 
     fn step(
         &mut self,
         input: Event<Payload, InjectedPayload>,
-        output: Context,
+        output: Context<InjectedPayload>,
     ) -> anyhow::Result<()>;
 }
 
 pub enum ToEvent<InjectedPayload = ()> {
-    Message(serde_json::Value),
+    Message(Message<serde_json::Value>),
     Injected(InjectedPayload),
     Eof,
 }
@@ -56,33 +43,57 @@ impl<IP> ToEvent<IP> {
         Payload: DeserializeOwned,
         IP: Clone,
     {
-        match self {
-            ToEvent::Message(e) => Ok(Event::Message(serde_json::from_value(e.clone())?)),
-            ToEvent::Injected(i) => Ok(Event::Injected(i.clone())),
-            ToEvent::Eof => Ok(Event::Eof),
-        }
+        let event = match self {
+            ToEvent::Message(e) => {
+                let body: Result<Payload, _> = serde_json::from_value(e.body.payload.clone());
+                if let Ok(body) = body {
+                    let message = Message {
+                        src: e.src.clone(),
+                        dst: e.dst.clone(),
+                        body: Body {
+                            id: e.body.id,
+                            in_reply_to: e.body.in_reply_to,
+                            payload: body,
+                        },
+                    };
+                    Event::Message(message)
+                } else {
+                    Event::Reply(e.clone())
+                }
+            }
+            ToEvent::Injected(i) => Event::Injected(i.clone()),
+            ToEvent::Eof => Event::Eof,
+        };
+        Ok(event)
     }
 }
 
-pub struct RpcRegistry {
-    registry: HashMap<TypeId, Box<dyn Handler>>,
-}
-
 #[derive(Clone)]
-pub struct Context {
+pub struct Context<IP> {
+    /// Allows sending messages as RPCs
     msg_out_tx: Sender<Box<dyn Serialize + Send + Sync + 'static>>,
-    registry: Rc<RefCell<RpcRegistry>>,
+
+    /// Allows injecting messages into the event loop
+    msg_in_tx: Sender<ToEvent<IP>>,
 }
 
-impl Context {
+impl<IP> Context<IP> {
     pub fn send<S>(&self, s: S) -> anyhow::Result<()>
     where
         S: Serialize + Sync + Send + 'static,
     {
         self.msg_out_tx
             .send(Box::new(s))
-            .context("send message to stdout")?;
-        Ok(())
+            .context("send message to stdout")
+    }
+
+    pub fn inject(&self, s: IP) -> anyhow::Result<()>
+    where
+        IP: Sync + Send + 'static,
+    {
+        self.msg_in_tx
+            .send(ToEvent::Injected(s))
+            .context("inject message into event loop")
     }
 }
 
@@ -100,22 +111,20 @@ impl Runtime {
 
         let (msg_out_tx, msg_out_rx) = std::sync::mpsc::channel();
 
-        let node: N = Self::init_node(init_state, &msg_in_tx, msg_out_tx.clone())?;
+        let context = Context {
+            msg_in_tx: msg_in_tx.clone(),
+            msg_out_tx: msg_out_tx.clone(),
+        };
+
+        let node: N = Self::init_node(init_state, context.clone())?;
         let node = node;
 
         let stdin_tx = msg_in_tx.clone();
         let input_handle = receive_loop::<N, S, P, IP>(stdin_tx, msg_in_tx);
 
         let output_handle = send_loop::<N, S, P, IP>(msg_out_rx);
-        let registry = Rc::new(RefCell::new(RpcRegistry {
-            registry: HashMap::new(),
-        }));
-        let context = Context {
-            registry: registry.clone(),
-            msg_out_tx: msg_out_tx.clone(),
-        };
 
-        event_loop(msg_in_rx, node, context, registry)?;
+        event_loop(msg_in_rx, node, context)?;
 
         input_handle
             .join()
@@ -129,11 +138,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn init_node<S, P, IP, N>(
-        init_state: S,
-        tx: &Sender<ToEvent<IP>>,
-        msg_out_tx: Sender<Box<dyn Serialize + Send + Sync + 'static>>,
-    ) -> Result<N, anyhow::Error>
+    fn init_node<S, P, IP, N>(init_state: S, context: Context<IP>) -> Result<N, anyhow::Error>
     where
         P: DeserializeOwned + Send + 'static,
         N: Node<S, P, IP>,
@@ -151,8 +156,8 @@ impl Runtime {
         let InitPayload::Init(init) = init_msg.body.payload else {
             panic!("first message should be init")
         };
-        let node =
-            N::from_init(init_state, init, tx.clone()).context("node initialization failed")?;
+        let node = N::from_init(init_state, init, context.clone())
+            .context("node initialization failed")?;
         let reply = Message {
             src: init_msg.dst,
             dst: init_msg.src,
@@ -162,9 +167,7 @@ impl Runtime {
                 payload: InitPayload::InitOk,
             },
         };
-        msg_out_tx
-            .send(Box::new(reply))
-            .context("send init reply to stdout")?;
+        context.send(reply).context("send init reply to stdout")?;
         Ok(node)
     }
 }
@@ -172,8 +175,7 @@ impl Runtime {
 fn event_loop<N, S, P, IP>(
     msg_in_rx: Receiver<ToEvent<IP>>,
     mut node: N,
-    context: Context,
-    registry: Rc<RefCell<RpcRegistry>>,
+    context: Context<IP>,
 ) -> Result<(), anyhow::Error>
 where
     N: Node<S, P, IP>,
@@ -188,16 +190,7 @@ where
             let ToEvent::Message(message) = input else {
                 panic!("Impossible position");
             };
-
-            // TODO: problem, how can I prevent registry from getting accessed in rpc handlers?
-            for handler in registry.borrow_mut().registry.values_mut() {
-                if handler.can_handle(&message) {
-                    handler
-                        .step(message, context.clone())
-                        .context("RpcHandler failed")?;
-                    break;
-                }
-            }
+            todo!("Handle message: {:?}", message);
         }
     }
 
@@ -216,8 +209,8 @@ where
         let stdin = std::io::stdin().lock();
         for line in stdin.lines() {
             let line = line.context("Maestrom input from STDIN could not be deserialized")?;
-            let input = serde_json::from_str::<serde_json::Value>(&line)
-                .context("read input message from STDIN")?;
+            let input: Message<serde_json::Value> =
+                serde_json::from_str(&line).context("read input message from STDIN")?;
             if let Err(_) = stdin_tx.send(ToEvent::Message(input)) {
                 break;
             }
