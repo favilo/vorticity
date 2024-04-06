@@ -7,7 +7,7 @@ use base64::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Body, Context, Event, Message, Node, Runtime};
+use vorticity::{Body, Context, Event, Init, Message, Node, Runtime};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     Map, ReadTxn, Transact,
@@ -35,7 +35,6 @@ enum InjectedPayload {
 }
 
 pub struct GCounterNode {
-    msg_id: usize,
     node_id: String,
     doc: yrs::Doc,
     counter: yrs::MapRef,
@@ -50,61 +49,58 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
         ctx: Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
-            Event::Message(input) => {
-                let mut reply = input.into_reply(Some(&mut self.msg_id));
-                match reply.body.payload {
-                    Payload::Add { delta } => {
-                        let mut txn = self.doc.transact_mut();
-                        let old_val = self
-                            .counter
-                            .get(&txn, &self.doc.client_id().to_string())
-                            .unwrap_or(yrs::Value::Any(0.into()))
-                            .cast::<i64>()
-                            .unwrap();
-                        self.counter.insert(
-                            &mut txn,
-                            self.doc.client_id().to_string(),
-                            old_val + delta as i64,
-                        );
+            Event::Message(input) => match input.body.payload {
+                Payload::Add { delta } => {
+                    let mut txn = self.doc.transact_mut();
+                    let old_val = self
+                        .counter
+                        .get(&txn, &self.doc.client_id().to_string())
+                        .unwrap_or(yrs::Value::Any(0.into()))
+                        .cast::<i64>()
+                        .unwrap();
+                    self.counter.insert(
+                        &mut txn,
+                        self.doc.client_id().to_string(),
+                        old_val + delta as i64,
+                    );
 
-                        reply.body.payload = Payload::AddOk;
-                        ctx.send(reply).context("serialize response to broadcast")?;
-                    }
-                    Payload::Read => {
-                        let txn = self.doc.transact();
-                        let value = self
-                            .counter
-                            .iter(&txn)
-                            .map(|(_, v)| -> u64 {
-                                v.cast::<i64>()
-                                    .expect("Not an integer")
-                                    .try_into()
-                                    .expect("all messages should be positive")
-                            })
-                            .sum();
-
-                        reply.body.payload = Payload::ReadOk { value };
-                        ctx.send(reply).context("serialize response to read")?;
-                    }
-
-                    Payload::Gossip { state_vector, diff } => {
-                        let state_vector = yrs::StateVector::decode_v1(
-                            &ENGINE
-                                .decode(&state_vector)
-                                .context("base64 decode failed")?,
-                        )
-                        .context("StateVector decode failed")?;
-                        let update = yrs::Update::decode_v1(
-                            &ENGINE.decode(&diff).context("base64 decode failed")?,
-                        )
-                        .context("Update decode failed")?;
-                        self.known.insert(reply.dst, state_vector);
-                        let mut txn = self.doc.transact_mut();
-                        txn.apply_update(update);
-                    }
-                    Payload::AddOk | Payload::ReadOk { .. } => {}
+                    let reply = ctx.construct_reply(&input, Payload::AddOk);
+                    ctx.send(reply).context("serialize response to broadcast")?;
                 }
-            }
+                Payload::Read => {
+                    let txn = self.doc.transact();
+                    let value = self
+                        .counter
+                        .iter(&txn)
+                        .map(|(_, v)| -> u64 {
+                            v.cast::<i64>()
+                                .expect("Not an integer")
+                                .try_into()
+                                .expect("all messages should be positive")
+                        })
+                        .sum();
+
+                    let reply = ctx.construct_reply(&input, Payload::ReadOk { value });
+                    ctx.send(reply).context("serialize response to read")?;
+                }
+
+                Payload::Gossip { state_vector, diff } => {
+                    let state_vector = yrs::StateVector::decode_v1(
+                        &ENGINE
+                            .decode(&state_vector)
+                            .context("base64 decode failed")?,
+                    )
+                    .context("StateVector decode failed")?;
+                    let update = yrs::Update::decode_v1(
+                        &ENGINE.decode(&diff).context("base64 decode failed")?,
+                    )
+                    .context("Update decode failed")?;
+                    self.known.insert(input.src, state_vector);
+                    let mut txn = self.doc.transact_mut();
+                    txn.apply_update(update);
+                }
+                Payload::AddOk | Payload::ReadOk { .. } => {}
+            },
             Event::Eof => {}
             Event::Injected(input) => match input {
                 InjectedPayload::Gossip => {
@@ -139,17 +135,13 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     }
                 }
             },
-            Event::Reply(_) => todo!(),
+            Event::Arbitrary(_) => todo!(),
         }
 
         Ok(())
     }
 
-    fn from_init(
-        _state: (),
-        init: vorticity::Init,
-        context: Context<InjectedPayload>,
-    ) -> anyhow::Result<Self>
+    fn from_init(_state: (), init: &Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -174,8 +166,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
             .filter(|_| rng.gen_bool(0.75))
             .collect();
         Ok(Self {
-            msg_id: 1,
-            node_id: init.node_id,
+            node_id: init.node_id.clone(),
             doc,
             counter,
             known: init

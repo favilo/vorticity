@@ -10,7 +10,7 @@ use base64::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Body, Context, Event, Message, Node, Runtime};
+use vorticity::{Body, Context, Event, Init, Message, Node, Runtime};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     Array, ReadTxn, Transact,
@@ -48,7 +48,6 @@ enum InjectedPayload {
 }
 
 pub struct BroadcastNode {
-    msg_id: usize,
     node_id: String,
     doc: yrs::Doc,
     messages: yrs::ArrayRef,
@@ -63,54 +62,51 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         ctx: Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
-            Event::Message(input) => {
-                let mut reply = input.into_reply(Some(&mut self.msg_id));
-                match reply.body.payload {
-                    Payload::Broadcast { message } => {
-                        let mut txn = self.doc.transact_mut();
-                        self.messages.push_back(&mut txn, message as i64);
+            Event::Message(input) => match input.body.payload {
+                Payload::Broadcast { message } => {
+                    let mut txn = self.doc.transact_mut();
+                    self.messages.push_back(&mut txn, message as i64);
 
-                        reply.body.payload = Payload::BroadcastOk;
-                        ctx.send(reply).context("serialize response to broadcast")?;
-                    }
-                    Payload::Read => {
-                        let txn = self.doc.transact();
-                        let messages = self
-                            .messages
-                            .iter(&txn)
-                            .map(|v| {
-                                v.cast::<i64>()
-                                    .expect("Not an integer")
-                                    .try_into()
-                                    .expect("all messages should be positive")
-                            })
-                            .collect();
-
-                        reply.body.payload = Payload::ReadOk { messages };
-                        ctx.send(reply).context("serialize response to read")?;
-                    }
-                    Payload::Topology { topology: _ } => {
-                        reply.body.payload = Payload::TopologyOk;
-                        ctx.send(reply).context("serialize response to topology")?;
-                    }
-                    Payload::Gossip { state_vector, diff } => {
-                        let state_vector = yrs::StateVector::decode_v1(
-                            &ENGINE
-                                .decode(&state_vector)
-                                .context("base64 decode failed")?,
-                        )
-                        .context("StateVector decode failed")?;
-                        let update = yrs::Update::decode_v1(
-                            &ENGINE.decode(&diff).context("base64 decode failed")?,
-                        )
-                        .context("Update decode failed")?;
-                        self.known.insert(reply.dst, state_vector);
-                        let mut txn = self.doc.transact_mut();
-                        txn.apply_update(update);
-                    }
-                    Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
+                    let reply = ctx.construct_reply(&input, Payload::BroadcastOk);
+                    ctx.send(reply).context("serialize response to broadcast")?;
                 }
-            }
+                Payload::Read => {
+                    let txn = self.doc.transact();
+                    let messages = self
+                        .messages
+                        .iter(&txn)
+                        .map(|v| {
+                            v.cast::<i64>()
+                                .expect("Not an integer")
+                                .try_into()
+                                .expect("all messages should be positive")
+                        })
+                        .collect();
+
+                    let reply = ctx.construct_reply(&input, Payload::ReadOk { messages });
+                    ctx.send(reply).context("serialize response to read")?;
+                }
+                Payload::Topology { topology: _ } => {
+                    let reply = ctx.construct_reply(&input, Payload::TopologyOk);
+                    ctx.send(reply).context("serialize response to topology")?;
+                }
+                Payload::Gossip { state_vector, diff } => {
+                    let state_vector = yrs::StateVector::decode_v1(
+                        &ENGINE
+                            .decode(&state_vector)
+                            .context("base64 decode failed")?,
+                    )
+                    .context("StateVector decode failed")?;
+                    let update = yrs::Update::decode_v1(
+                        &ENGINE.decode(&diff).context("base64 decode failed")?,
+                    )
+                    .context("Update decode failed")?;
+                    self.known.insert(input.src, state_vector);
+                    let mut txn = self.doc.transact_mut();
+                    txn.apply_update(update);
+                }
+                Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
+            },
             Event::Eof => {}
             Event::Injected(input) => match input {
                 InjectedPayload::Gossip => {
@@ -146,17 +142,13 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     }
                 }
             },
-            Event::Reply(_) => todo!(),
+            Event::Arbitrary(_) => todo!(),
         }
 
         Ok(())
     }
 
-    fn from_init(
-        _state: (),
-        init: vorticity::Init,
-        context: Context<InjectedPayload>,
-    ) -> anyhow::Result<Self>
+    fn from_init(_state: (), init: &Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -181,8 +173,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             .filter(|_| rng.gen_bool(0.75))
             .collect();
         Ok(Self {
-            msg_id: 1,
-            node_id: init.node_id,
+            node_id: init.node_id.clone(),
             doc,
             messages,
             known: init

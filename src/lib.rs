@@ -1,15 +1,19 @@
 use std::{
     io::{BufRead, Write},
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        atomic::AtomicUsize,
+        mpsc::{Receiver, Sender},
+        Arc,
+    },
     thread,
 };
 
 use anyhow::Context as _;
-
 use erased_serde::Serialize;
-use message::InitPayload;
-pub use message::{Body, Event, Init, Message};
 use serde::{de::DeserializeOwned, Deserialize};
+
+pub use message::{Body, Context, Event, Init, Message};
+use message::{InitPayload, ToEvent};
 
 pub mod message;
 // pub mod rpc;
@@ -20,7 +24,7 @@ pub trait Handler<IP> {
 }
 
 pub trait Node<S, Payload, InjectedPayload = ()> {
-    fn from_init(state: S, init: Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
+    fn from_init(state: S, init: &Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
     where
         Self: Sized;
 
@@ -29,72 +33,6 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
         input: Event<Payload, InjectedPayload>,
         output: Context<InjectedPayload>,
     ) -> anyhow::Result<()>;
-}
-
-pub enum ToEvent<InjectedPayload = ()> {
-    Message(Message<serde_json::Value>),
-    Injected(InjectedPayload),
-    Eof,
-}
-
-impl<IP> ToEvent<IP> {
-    pub fn to_event<Payload>(&self) -> anyhow::Result<Event<Payload, IP>>
-    where
-        Payload: DeserializeOwned,
-        IP: Clone,
-    {
-        let event = match self {
-            ToEvent::Message(e) => {
-                let body: Result<Payload, _> = serde_json::from_value(e.body.payload.clone());
-                if let Ok(body) = body {
-                    let message = Message {
-                        src: e.src.clone(),
-                        dst: e.dst.clone(),
-                        body: Body {
-                            id: e.body.id,
-                            in_reply_to: e.body.in_reply_to,
-                            payload: body,
-                        },
-                    };
-                    Event::Message(message)
-                } else {
-                    Event::Reply(e.clone())
-                }
-            }
-            ToEvent::Injected(i) => Event::Injected(i.clone()),
-            ToEvent::Eof => Event::Eof,
-        };
-        Ok(event)
-    }
-}
-
-#[derive(Clone)]
-pub struct Context<IP> {
-    /// Allows sending messages as RPCs
-    msg_out_tx: Sender<Box<dyn Serialize + Send + Sync + 'static>>,
-
-    /// Allows injecting messages into the event loop
-    msg_in_tx: Sender<ToEvent<IP>>,
-}
-
-impl<IP> Context<IP> {
-    pub fn send<S>(&self, s: S) -> anyhow::Result<()>
-    where
-        S: Serialize + Sync + Send + 'static,
-    {
-        self.msg_out_tx
-            .send(Box::new(s))
-            .context("send message to stdout")
-    }
-
-    pub fn inject(&self, s: IP) -> anyhow::Result<()>
-    where
-        IP: Sync + Send + 'static,
-    {
-        self.msg_in_tx
-            .send(ToEvent::Injected(s))
-            .context("inject message into event loop")
-    }
 }
 
 pub struct Runtime;
@@ -111,10 +49,11 @@ impl Runtime {
 
         let (msg_out_tx, msg_out_rx) = std::sync::mpsc::channel();
 
-        let context = Context {
-            msg_in_tx: msg_in_tx.clone(),
-            msg_out_tx: msg_out_tx.clone(),
-        };
+        let context = Context::new(
+            msg_in_tx.clone(),
+            msg_out_tx.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         let node: N = Self::init_node(init_state, context.clone())?;
         let node = node;
@@ -153,48 +92,16 @@ impl Runtime {
                 .context("failed to read init message from stdin")?,
         )
         .context("read init message from STDIN")?;
-        let InitPayload::Init(init) = init_msg.body.payload else {
+        let InitPayload::Init(ref init) = init_msg.body.payload else {
             panic!("first message should be init")
         };
         let node = N::from_init(init_state, init, context.clone())
             .context("node initialization failed")?;
-        let reply = Message {
-            src: init_msg.dst,
-            dst: init_msg.src,
-            body: Body {
-                id: Some(0),
-                in_reply_to: init_msg.body.id,
-                payload: InitPayload::InitOk,
-            },
-        };
+        let reply = context.construct_reply(&init_msg, InitPayload::InitOk);
+
         context.send(reply).context("send init reply to stdout")?;
         Ok(node)
     }
-}
-
-fn event_loop<N, S, P, IP>(
-    msg_in_rx: Receiver<ToEvent<IP>>,
-    mut node: N,
-    context: Context<IP>,
-) -> Result<(), anyhow::Error>
-where
-    N: Node<S, P, IP>,
-    P: for<'de> Deserialize<'de> + Send + 'static,
-    IP: Clone + Send + 'static,
-{
-    for input in msg_in_rx {
-        if let Ok(input) = input.to_event() {
-            node.step(input, context.clone())
-                .context("Node step function failed")?;
-        } else {
-            let ToEvent::Message(message) = input else {
-                panic!("Impossible position");
-            };
-            todo!("Handle message: {:?}", message);
-        }
-    }
-
-    Ok(())
 }
 
 fn receive_loop<N, S, P, IP>(
@@ -240,8 +147,30 @@ where
     output_handle
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NodeState {
-    pub node_id: String,
-    pub nodes: Vec<String>,
+fn event_loop<N, S, P, IP>(
+    msg_in_rx: Receiver<ToEvent<IP>>,
+    mut node: N,
+    context: Context<IP>,
+) -> Result<(), anyhow::Error>
+where
+    N: Node<S, P, IP>,
+    P: for<'de> Deserialize<'de> + Send + 'static,
+    IP: Clone + Send + 'static,
+{
+    for input in msg_in_rx {
+        if let Ok(input) = input.to_event() {
+            if input.is_reply() {
+                todo!("Handle reply");
+            }
+            node.step(input, context.clone())
+                .context("Node step function failed")?;
+        } else {
+            let ToEvent::Message(message) = input else {
+                panic!("Impossible position");
+            };
+            todo!("Handle message: {:?}", message);
+        }
+    }
+
+    Ok(())
 }

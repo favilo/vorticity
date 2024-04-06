@@ -7,7 +7,7 @@ use base64::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Body, Context, Event, Message, Node, Runtime};
+use vorticity::{message::Init, Body, Context, Event, Message, Node, Runtime};
 use yrs::{
     types::ToJson,
     updates::{decoder::Decode, encoder::Encode},
@@ -67,7 +67,6 @@ enum InjectedPayload {
 }
 
 pub struct KafkaNode {
-    msg_id: usize,
     node_id: String,
     doc: yrs::Doc,
     logs: yrs::MapRef,
@@ -83,103 +82,39 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         ctx: Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
-            Event::Message(input) => {
-                let mut reply = input.into_reply(Some(&mut self.msg_id));
-                match reply.body.payload {
-                    Payload::Send { key, msg } => {
-                        let mut txn = self.doc.transact_mut();
-                        let list = self.logs.get(&txn, &key);
-                        let list = match list {
-                            Some(Value::YArray(list)) => list,
-                            _ => {
-                                let list: ArrayRef =
-                                    self.logs
-                                        .insert(&mut txn, key.clone(), ArrayPrelim::default());
-                                list
-                            }
-                        };
-
-                        list.push_back(&mut txn, msg);
-                        txn.commit();
-
-                        reply.body.payload = Payload::SendOk {
-                            offset: list.len(&txn) as u64 - 1,
-                        };
-                        ctx.send(reply).context("serialize response to broadcast")?;
-                    }
-                    Payload::Poll { offsets } => {
-                        let txn = self.doc.transact();
-                        let offsets = offsets
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                let list = self.logs.get(&txn, k)?.cast::<ArrayRef>().ok()?;
-                                Some((
-                                    k.clone(),
-                                    list.iter(&txn)
-                                        .enumerate()
-                                        .skip(*v as usize)
-                                        .map(|(i, v)| (i as u64, v.to_json(&txn)))
-                                        .collect::<Vec<(u64, Msg)>>(),
-                                ))
-                            })
-                            .collect::<HashMap<String, Vec<(u64, Msg)>>>();
-
-                        reply.body.payload = Payload::PollOk { msgs: offsets };
-                        ctx.send(reply).context("serialize response to read")?;
-                    }
-                    Payload::CommitOffsets { offsets } => {
-                        let mut txn = self.doc.transact_mut();
-                        offsets.iter().for_each(|(k, v)| {
-                            self.offsets.insert(&mut txn, k.clone(), *v as i64);
-                        });
-
-                        reply.body.payload = Payload::CommitOffsetsOk;
-                        ctx.send(reply).context("serialize response to commit")?;
-                    }
-                    Payload::ListCommittedOffsets { keys } => {
-                        let txn = self.doc.transact();
-                        let offsets = keys
-                            .iter()
-                            .map(|k| {
-                                (
-                                    k.clone(),
-                                    self.offsets
-                                        .get(&txn, k)
-                                        .unwrap_or(Value::Any(0.into()))
-                                        .cast::<i64>()
-                                        .unwrap() as u64,
-                                )
-                            })
-                            .collect();
-                        reply.body.payload = Payload::ListCommittedOffsetsOk { offsets };
-                        ctx.send(reply).context("serialize response to commit")?;
-                    }
-
-                    Payload::Admin(admin_payload) => {
-                        reply.body.payload = Payload::Admin(admin_payload);
-                        self.handle_admin(&mut reply, &ctx)?;
-                    }
-                    Payload::PollOk { .. }
-                    | Payload::SendOk { .. }
-                    | Payload::ListCommittedOffsetsOk { .. }
-                    | Payload::CommitOffsetsOk => {}
+            Event::Message(input) => match input.body.payload {
+                Payload::Send { ref key, ref msg } => {
+                    self.handle_send(key, msg, &ctx, &input)?;
                 }
-            }
+                Payload::Poll { ref offsets } => {
+                    self.handle_poll(offsets, &ctx, &input)?;
+                }
+                Payload::CommitOffsets { ref offsets } => {
+                    self.handle_commit_offsets(offsets, &ctx, &input)?;
+                }
+                Payload::ListCommittedOffsets { ref keys } => {
+                    self.handle_list_committed_offsets(keys, &ctx, &input)?;
+                }
+
+                Payload::Admin(_) => {
+                    self.handle_admin(&input, &ctx)?;
+                }
+                Payload::PollOk { .. }
+                | Payload::SendOk { .. }
+                | Payload::ListCommittedOffsetsOk { .. }
+                | Payload::CommitOffsetsOk => {}
+            },
             Event::Eof => {}
             Event::Injected(input) => {
                 self.handle_injected(input, &ctx)?;
             }
-            Event::Reply(_) => todo!(),
+            Event::Arbitrary(_) => todo!(),
         }
 
         Ok(())
     }
 
-    fn from_init(
-        _state: (),
-        init: vorticity::message::Init,
-        context: Context<InjectedPayload>,
-    ) -> anyhow::Result<Self>
+    fn from_init(_state: (), init: &Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -205,8 +140,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             .filter(|_| rng.gen_bool(0.75))
             .collect();
         Ok(Self {
-            msg_id: 1,
-            node_id: init.node_id,
+            node_id: init.node_id.clone(),
             doc,
             logs,
             offsets,
@@ -224,10 +158,10 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
 impl KafkaNode {
     fn handle_injected(
         &mut self,
-        input: InjectedPayload,
+        injected: InjectedPayload,
         ctx: &Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
-        match input {
+        match injected {
             InjectedPayload::Gossip => {
                 for n in &self.neighborhood {
                     if n == &self.node_id {
@@ -268,10 +202,10 @@ impl KafkaNode {
 
     fn handle_admin(
         &mut self,
-        reply: &mut Message<Payload>,
-        _output: &Context<InjectedPayload>,
+        input: &Message<Payload>,
+        _ctx: &Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
-        let Payload::Admin(admin_payload) = &reply.body.payload else {
+        let Payload::Admin(admin_payload) = &input.body.payload else {
             anyhow::bail!("expected Admin payload");
         };
         match admin_payload {
@@ -285,12 +219,106 @@ impl KafkaNode {
                 let update =
                     yrs::Update::decode_v1(&ENGINE.decode(&diff).context("base64 decode failed")?)
                         .context("Update decode failed")?;
-                self.known.insert(reply.dst.clone(), state_vector);
+                self.known.insert(input.src.clone(), state_vector);
                 let mut txn = self.doc.transact_mut();
                 txn.apply_update(update);
             }
         };
 
+        Ok(())
+    }
+
+    fn handle_send(
+        &mut self,
+        key: &str,
+        msg: &yrs::Any,
+        ctx: &Context<InjectedPayload>,
+        input: &Message<Payload>,
+    ) -> Result<(), anyhow::Error> {
+        let mut txn = self.doc.transact_mut();
+        let list = self.logs.get(&txn, &key);
+        let list = match list {
+            Some(Value::YArray(list)) => list,
+            _ => {
+                let list: ArrayRef = self.logs.insert(&mut txn, key, ArrayPrelim::default());
+                list
+            }
+        };
+        list.push_back(&mut txn, msg.clone());
+        txn.commit();
+        let reply = ctx.construct_reply(
+            &input,
+            Payload::SendOk {
+                offset: list.len(&txn) as u64 - 1,
+            },
+        );
+        ctx.send(reply).context("serialize response to broadcast")?;
+        Ok(())
+    }
+
+    fn handle_poll(
+        &mut self,
+        offsets: &HashMap<String, u64>,
+        ctx: &Context<InjectedPayload>,
+        input: &Message<Payload>,
+    ) -> Result<(), anyhow::Error> {
+        let txn = self.doc.transact();
+        let offsets = offsets
+            .iter()
+            .filter_map(|(k, v)| {
+                let list = self.logs.get(&txn, k)?.cast::<ArrayRef>().ok()?;
+                Some((
+                    k.clone(),
+                    list.iter(&txn)
+                        .enumerate()
+                        .skip(*v as usize)
+                        .map(|(i, v)| (i as u64, v.to_json(&txn)))
+                        .collect::<Vec<(u64, Msg)>>(),
+                ))
+            })
+            .collect::<HashMap<String, Vec<(u64, Msg)>>>();
+        let reply = ctx.construct_reply(&input, Payload::PollOk { msgs: offsets });
+        ctx.send(reply).context("serialize response to read")?;
+        Ok(())
+    }
+
+    fn handle_commit_offsets(
+        &mut self,
+        offsets: &HashMap<String, u64>,
+        ctx: &Context<InjectedPayload>,
+        input: &Message<Payload>,
+    ) -> Result<(), anyhow::Error> {
+        let mut txn = self.doc.transact_mut();
+        offsets.iter().for_each(|(k, v)| {
+            self.offsets.insert(&mut txn, k.clone(), *v as i64);
+        });
+        let reply = ctx.construct_reply(&input, Payload::CommitOffsetsOk);
+        ctx.send(reply).context("serialize response to commit")?;
+        Ok(())
+    }
+
+    fn handle_list_committed_offsets(
+        &mut self,
+        keys: &Vec<String>,
+        ctx: &Context<InjectedPayload>,
+        input: &Message<Payload>,
+    ) -> Result<(), anyhow::Error> {
+        let txn = self.doc.transact();
+        let offsets = keys
+            .iter()
+            .map(|k| {
+                (
+                    k.clone(),
+                    self.offsets
+                        .get(&txn, k)
+                        .unwrap_or(Value::Any(0.into()))
+                        .cast::<i64>()
+                        .unwrap() as u64,
+                )
+            })
+            .collect();
+        let reply = ctx.construct_reply(&input, Payload::ListCommittedOffsetsOk { offsets });
+        ctx.send(reply).context("serialize response to commit")?;
         Ok(())
     }
 }

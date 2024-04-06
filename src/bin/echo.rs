@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use vorticity::{Context, Event, Node, Runtime};
+use vorticity::{Context, Event, Init, Node, Runtime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -19,10 +19,9 @@ impl Node<(), Payload> for EchoNode {
         let Event::Message(input) = input else {
             unreachable!()
         };
-        let mut reply = input.into_reply(Some(&mut self.id));
-        match reply.body.payload {
-            Payload::Echo { echo } => {
-                reply.body.payload = Payload::EchoOk { echo };
+        match input.body.payload {
+            Payload::Echo { ref echo } => {
+                let reply = ctx.construct_reply(&input, Payload::EchoOk { echo: echo.clone() });
                 ctx.send(reply).context("serialize response to echo")?;
             }
             Payload::EchoOk { .. } => {}
@@ -31,7 +30,7 @@ impl Node<(), Payload> for EchoNode {
         Ok(())
     }
 
-    fn from_init(_state: (), _init: vorticity::Init, _ctx: Context<()>) -> anyhow::Result<Self>
+    fn from_init(_state: (), _init: &Init, _ctx: Context<()>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
