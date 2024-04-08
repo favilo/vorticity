@@ -22,7 +22,7 @@ impl Node<(), Payload> for UniqueNode {
         let Event::Message(input) = input else {
             unreachable!();
         };
-        match input.body.payload {
+        match input.body().payload {
             Payload::Generate => {
                 let guid = format!("{}-{}", self.node, ctx.msg_id());
                 let reply = ctx.construct_reply(&input, Payload::GenerateOk { guid });

@@ -7,17 +7,95 @@ use anyhow::Context as _;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Default)]
+pub struct MessageBuilder<Payload> {
+    src: Option<String>,
+    dst: Option<String>,
+    id: Option<usize>,
+    in_reply_to: Option<usize>,
+    payload: Option<Payload>,
+}
+
+impl<Payload> MessageBuilder<Payload> {
+    pub fn new() -> Self {
+        Self {
+            src: None,
+            dst: None,
+            id: None,
+            in_reply_to: None,
+            payload: None,
+        }
+    }
+
+    pub fn src(mut self, src: String) -> Self {
+        self.src = Some(src);
+        self
+    }
+
+    pub fn dst(mut self, dst: String) -> Self {
+        self.dst = Some(dst);
+        self
+    }
+
+    pub fn id(mut self, ctx: Context<Payload>) -> Self {
+        self.id = Some(ctx.next_msg_id());
+        self
+    }
+
+    pub fn in_reply_to(mut self, in_reply_to: usize) -> Self {
+        self.in_reply_to = Some(in_reply_to);
+        self
+    }
+
+    pub fn payload(mut self, payload: Payload) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
+    pub fn build(self) -> anyhow::Result<Message<Payload>> {
+        Ok(Message {
+            src: self.src.context("src is required to build a message")?,
+            dst: self.dst.context("dst is required to build a message")?,
+            body: Body {
+                id: self.id,
+                in_reply_to: self.in_reply_to,
+                payload: self
+                    .payload
+                    .context("payload is required to build a message")?,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message<Payload> {
     /// The id of the node that sent the message.
-    pub src: String,
+    src: String,
 
     /// The id of the node that the message is intended for.
     #[serde(rename = "dest")]
-    pub dst: String,
+    dst: String,
 
     /// The body of the message.
-    pub body: Body<Payload>,
+    body: Body<Payload>,
+}
+
+impl<Payload> Message<Payload> {
+    pub fn builder() -> MessageBuilder<Payload> {
+        MessageBuilder::new()
+    }
+
+    pub fn src(&self) -> &str {
+        &self.src
+    }
+
+    pub fn dst(&self) -> &str {
+        &self.dst
+    }
+
+    pub fn body(&self) -> &Body<Payload> {
+        &self.body
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,9 +134,16 @@ pub struct Init {
 
 #[derive(Debug, Clone)]
 pub enum Event<Payload, InjectedPayload = ()> {
+    /// A message intended for the Node.
     Message(Message<Payload>),
+
+    /// An inected message from a Node specific event loop.
     Injected(InjectedPayload),
+
+    /// Intended to be used for things like lin-kv and seq-kv.
     Arbitrary(Message<Value>),
+
+    /// Indicates that the event loop should stop.
     Eof,
 }
 
@@ -164,6 +249,11 @@ impl<IP> Context<IP> {
             .context("inject message into event loop")
     }
 
+    pub fn next_msg_id(&self) -> usize {
+        self.msg_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn construct_reply<Payload>(
         &self,
         msg: &Message<Payload>,
@@ -172,9 +262,7 @@ impl<IP> Context<IP> {
     where
         Payload: Serialize,
     {
-        let id = self
-            .msg_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self.next_msg_id();
         Message {
             src: msg.dst.clone(),
             dst: msg.src.clone(),
@@ -185,6 +273,13 @@ impl<IP> Context<IP> {
             },
         }
     }
+
+    pub fn send_rpc<Payload>(&self, msg: Message<Payload>) -> anyhow::Result<()>
+    where
+        Payload: Serialize + Sync + Send + 'static,
+    {
+        self.send(msg)
+    }
 }
 
 pub struct MessageSet<Payload> {
@@ -193,4 +288,27 @@ pub struct MessageSet<Payload> {
 
     /// The count of messages that were sent.
     count: usize,
+}
+
+impl<Payload> MessageSet<Payload>
+where
+    Payload: Clone,
+{
+    pub fn new(msgs: &[Message<Payload>]) -> Self {
+        let messages = msgs
+            .iter()
+            .map(|msg| -> (usize, Message<Payload>) { (msg.body.id.unwrap(), msg.clone()) })
+            .collect();
+        Self {
+            messages,
+            count: msgs.len(),
+        }
+    }
+
+    pub fn is_matching_reply(&self, msg: &Message<Payload>) -> bool {
+        msg.body
+            .in_reply_to
+            .map(|id| self.messages.contains_key(&id))
+            .unwrap_or(false)
+    }
 }

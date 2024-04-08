@@ -31,8 +31,16 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
     fn step(
         &mut self,
         input: Event<Payload, InjectedPayload>,
-        output: Context<InjectedPayload>,
+        context: Context<InjectedPayload>,
     ) -> anyhow::Result<()>;
+
+    fn handle_reply(
+        &mut self,
+        input: Event<Payload, InjectedPayload>,
+        output: Context<InjectedPayload>,
+    ) -> anyhow::Result<()> {
+        self.step(input, output)
+    }
 }
 
 pub struct Runtime;
@@ -59,9 +67,9 @@ impl Runtime {
         let node = node;
 
         let stdin_tx = msg_in_tx.clone();
-        let input_handle = receive_loop::<N, S, P, IP>(stdin_tx, msg_in_tx);
+        let input_handle = receive_loop::<IP>(stdin_tx, msg_in_tx);
 
-        let output_handle = send_loop::<N, S, P, IP>(msg_out_rx);
+        let output_handle = send_loop(msg_out_rx);
 
         event_loop(msg_in_rx, node, context)?;
 
@@ -92,7 +100,7 @@ impl Runtime {
                 .context("failed to read init message from stdin")?,
         )
         .context("read init message from STDIN")?;
-        let InitPayload::Init(ref init) = init_msg.body.payload else {
+        let InitPayload::Init(ref init) = init_msg.body().payload else {
             panic!("first message should be init")
         };
         let node = N::from_init(init_state, init, context.clone())
@@ -104,47 +112,56 @@ impl Runtime {
     }
 }
 
-fn receive_loop<N, S, P, IP>(
+#[allow(dead_code)]
+fn rpc_loop<P>(
+    _rpc_in_rx: Receiver<Message<P>>,
+    _msg_out_tx: Sender<Box<dyn Serialize + Send + Sync>>,
+) -> thread::JoinHandle<Result<(), anyhow::Error>>
+where
+    P: Clone + Send + 'static,
+{
+    thread::spawn(|| {
+        todo!("Figure out how to extract this from the indvidual nodes");
+
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn receive_loop<IP>(
     stdin_tx: Sender<ToEvent<IP>>,
     msg_in_tx: Sender<ToEvent<IP>>,
 ) -> thread::JoinHandle<Result<(), anyhow::Error>>
 where
-    N: Node<S, P, IP>,
     IP: Clone + Send + 'static,
 {
-    let input_handle = thread::spawn(move || {
+    thread::spawn(move || {
         let stdin = std::io::stdin().lock();
         for line in stdin.lines() {
             let line = line.context("Maestrom input from STDIN could not be deserialized")?;
             let input: Message<serde_json::Value> =
                 serde_json::from_str(&line).context("read input message from STDIN")?;
-            if let Err(_) = stdin_tx.send(ToEvent::Message(input)) {
+            if stdin_tx.send(ToEvent::Message(input)).is_err() {
                 break;
             }
         }
         let _ = msg_in_tx.send(ToEvent::Eof);
 
         Ok::<_, anyhow::Error>(())
-    });
-    input_handle
+    })
 }
 
-fn send_loop<N, S, P, IP>(
+fn send_loop(
     msg_out_rx: Receiver<Box<dyn Serialize + Send + Sync>>,
-) -> thread::JoinHandle<Result<(), anyhow::Error>>
-where
-    N: Node<S, P, IP>,
-    IP: Clone + Send + 'static,
-{
-    let output_handle = thread::spawn(move || {
+) -> thread::JoinHandle<Result<(), anyhow::Error>> {
+    thread::spawn(move || {
         let mut stdout = std::io::stdout().lock();
         for send_msg in msg_out_rx {
             serde_json::to_writer(&mut stdout, &send_msg).context("serialize response to init")?;
             stdout.write_all(b"\n").context("write newline to output")?;
         }
         Ok::<_, anyhow::Error>(())
-    });
-    output_handle
+    })
 }
 
 fn event_loop<N, S, P, IP>(
@@ -160,7 +177,10 @@ where
     for input in msg_in_rx {
         if let Ok(input) = input.to_event() {
             if input.is_reply() {
-                todo!("Handle reply");
+                // TODO: Figure out how to get original Message from our RPC system
+                node.handle_reply(input, context.clone())
+                    .context("Node handle reply function failed")?;
+                continue;
             }
             node.step(input, context.clone())
                 .context("Node step function failed")?;

@@ -19,7 +19,7 @@ impl Node<(), Payload> for EchoNode {
         let Event::Message(input) = input else {
             unreachable!()
         };
-        match input.body.payload {
+        match input.body().payload {
             Payload::Echo { ref echo } => {
                 let reply = ctx.construct_reply(&input, Payload::EchoOk { echo: echo.clone() });
                 ctx.send(reply).context("serialize response to echo")?;

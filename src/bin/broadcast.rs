@@ -10,7 +10,7 @@ use base64::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Body, Context, Event, Init, Message, Node, Runtime};
+use vorticity::{Context, Event, Init, Message, Node, Runtime};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     Array, ReadTxn, Transact,
@@ -62,7 +62,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         ctx: Context<InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
-            Event::Message(input) => match input.body.payload {
+            Event::Message(input) => match input.body().payload {
                 Payload::Broadcast { message } => {
                     let mut txn = self.doc.transact_mut();
                     self.messages.push_back(&mut txn, message as i64);
@@ -90,18 +90,21 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     let reply = ctx.construct_reply(&input, Payload::TopologyOk);
                     ctx.send(reply).context("serialize response to topology")?;
                 }
-                Payload::Gossip { state_vector, diff } => {
+                Payload::Gossip {
+                    ref state_vector,
+                    ref diff,
+                } => {
                     let state_vector = yrs::StateVector::decode_v1(
                         &ENGINE
-                            .decode(&state_vector)
+                            .decode(state_vector)
                             .context("base64 decode failed")?,
                     )
                     .context("StateVector decode failed")?;
                     let update = yrs::Update::decode_v1(
-                        &ENGINE.decode(&diff).context("base64 decode failed")?,
+                        &ENGINE.decode(diff).context("base64 decode failed")?,
                     )
                     .context("Update decode failed")?;
-                    self.known.insert(input.src, state_vector);
+                    self.known.insert(input.src().to_string(), state_vector);
                     let mut txn = self.doc.transact_mut();
                     txn.apply_update(update);
                 }
@@ -113,7 +116,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     for n in &self.neighborhood {
                         let remote_state_vector = &self.known[n];
                         let txn = self.doc.transact();
-                        let diff = ENGINE.encode(&txn.encode_diff_v1(&remote_state_vector));
+                        let diff = ENGINE.encode(&txn.encode_diff_v1(remote_state_vector));
                         let state_vector = &txn.state_vector();
 
                         // Send the update 10% of the time, even if it's the same as the remote state
@@ -129,15 +132,13 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         );
                         eprintln!("sending diff to {}: {} bytes", n, diff.len());
 
-                        ctx.send(Message {
-                            src: self.node_id.clone(),
-                            dst: n.clone(),
-                            body: Body {
-                                id: None,
-                                in_reply_to: None,
-                                payload: Payload::Gossip { state_vector, diff },
-                            },
-                        })
+                        ctx.send(
+                            Message::builder()
+                                .src(self.node_id.clone())
+                                .dst(n.clone())
+                                .payload(Payload::Gossip { state_vector, diff })
+                                .build()?,
+                        )
                         .with_context(|| format!("sending Gossip to {}", n))?;
                     }
                 }
@@ -157,7 +158,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             // TODO: handle EOF signal
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                if let Err(_) = context.inject(InjectedPayload::Gossip) {
+                if context.inject(InjectedPayload::Gossip).is_err() {
                     break;
                 }
             }
@@ -169,8 +170,8 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         let neighborhood = init
             .node_ids
             .iter()
+            .filter(|&_| rng.gen_bool(0.75))
             .cloned()
-            .filter(|_| rng.gen_bool(0.75))
             .collect();
         Ok(Self {
             node_id: init.node_id.clone(),
