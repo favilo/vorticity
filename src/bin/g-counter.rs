@@ -1,13 +1,13 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::Context as _;
 use base64::{
     engine::{GeneralPurpose, GeneralPurposeConfig},
     Engine,
 };
+use miette::{Context as _, IntoDiagnostic};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{Context, Event, Init, Message, Node, Runtime};
+use vorticity::{error::Result, Context, Event, Init, Message, Node, Runtime};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     Map, ReadTxn, Transact,
@@ -29,7 +29,7 @@ pub enum Payload {
     Gossip { diff: String, state_vector: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum InjectedPayload {
     Gossip,
 }
@@ -43,11 +43,7 @@ pub struct GCounterNode {
 }
 
 impl Node<(), Payload, InjectedPayload> for GCounterNode {
-    fn step(
-        &mut self,
-        input: Event<Payload, InjectedPayload>,
-        ctx: Context<InjectedPayload>,
-    ) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload, InjectedPayload>, ctx: Context) -> Result<()> {
         match input {
             Event::Message(input) => match input.body().payload {
                 Payload::Add { delta } => {
@@ -91,12 +87,18 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     let state_vector = yrs::StateVector::decode_v1(
                         &ENGINE
                             .decode(state_vector)
+                            .into_diagnostic()
                             .context("base64 decode failed")?,
                     )
+                    .into_diagnostic()
                     .context("StateVector decode failed")?;
                     let update = yrs::Update::decode_v1(
-                        &ENGINE.decode(diff).context("base64 decode failed")?,
+                        &ENGINE
+                            .decode(diff)
+                            .into_diagnostic()
+                            .context("base64 decode failed")?,
                     )
+                    .into_diagnostic()
                     .context("Update decode failed")?;
                     self.known.insert(input.src().to_string(), state_vector);
                     let mut txn = self.doc.transact_mut();
@@ -136,13 +138,12 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     }
                 }
             },
-            Event::Arbitrary(_) => todo!(),
         }
 
         Ok(())
     }
 
-    fn from_init(_state: (), init: &Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
+    fn from_init(_runtime: &Runtime, _state: (), init: &Init, context: Context) -> Result<Self>
     where
         Self: Sized,
     {
@@ -163,6 +164,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
         let neighborhood = init
             .node_ids
             .iter()
+            .filter(|&n| n != &init.node_id)
             .filter(|&_| rng.gen_bool(0.75))
             .cloned()
             .collect();
@@ -181,6 +183,6 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    Runtime::run::<_, Payload, InjectedPayload, GCounterNode>(())
+fn main() -> Result<()> {
+    Ok(Runtime::new().run::<_, Payload, InjectedPayload, GCounterNode>(())?)
 }
