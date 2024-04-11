@@ -5,7 +5,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum Error {
-    #[error("error: {0}")]
+    #[error(transparent)]
     #[diagnostic(transparent)]
     Miette(#[from] Box<dyn miette::Diagnostic + Send + Sync + 'static>),
 
