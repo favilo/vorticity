@@ -3,9 +3,11 @@ use std::{
     sync::{atomic::AtomicUsize, mpsc::Sender, Arc},
 };
 
-use anyhow::Context as _;
+use miette::{miette, Context as _, IntoDiagnostic};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::error::Result;
 
 #[derive(Debug, Default)]
 pub struct MessageBuilder<Payload> {
@@ -37,7 +39,7 @@ impl<Payload> MessageBuilder<Payload> {
         self
     }
 
-    pub fn id(mut self, ctx: Context<Payload>) -> Self {
+    pub fn id(mut self, ctx: Context) -> Self {
         self.id = Some(ctx.next_msg_id());
         self
     }
@@ -52,16 +54,20 @@ impl<Payload> MessageBuilder<Payload> {
         self
     }
 
-    pub fn build(self) -> anyhow::Result<Message<Payload>> {
+    pub fn build(self) -> Result<Message<Payload>> {
         Ok(Message {
-            src: self.src.context("src is required to build a message")?,
-            dst: self.dst.context("dst is required to build a message")?,
+            src: self
+                .src
+                .ok_or(miette!("src is required to build a message"))?,
+            dst: self
+                .dst
+                .ok_or(miette!("dst is required to build a message"))?,
             body: Body {
                 id: self.id,
                 in_reply_to: self.in_reply_to,
                 payload: self
                     .payload
-                    .context("payload is required to build a message")?,
+                    .ok_or(miette!("payload is required to build a message"))?,
             },
         })
     }
@@ -140,9 +146,6 @@ pub enum Event<Payload, InjectedPayload = ()> {
     /// An inected message from a Node specific event loop.
     Injected(InjectedPayload),
 
-    /// Intended to be used for things like lin-kv and seq-kv.
-    Arbitrary(Message<Value>),
-
     /// Indicates that the event loop should stop.
     Eof,
 }
@@ -150,49 +153,47 @@ pub enum Event<Payload, InjectedPayload = ()> {
 impl<Payload, InjectedPayload> Event<Payload, InjectedPayload>
 where
     Payload: for<'de> Deserialize<'de> + Send + 'static,
-    InjectedPayload: Clone + Send + 'static,
+    InjectedPayload: for<'de> Deserialize<'de> + Send + 'static,
 {
     pub(crate) fn is_reply(&self) -> bool {
         match self {
             Event::Message(msg) => msg.body.in_reply_to.is_some(),
-            Event::Arbitrary(msg) => msg.body.in_reply_to.is_some(),
             _ => false,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub enum ToEvent<InjectedPayload = ()> {
+pub enum ToEvent {
     Message(Message<serde_json::Value>),
-    Injected(InjectedPayload),
+    Injected(Value),
     Eof,
 }
 
-impl<IP> ToEvent<IP> {
-    pub fn to_event<Payload>(&self) -> anyhow::Result<Event<Payload, IP>>
+impl ToEvent {
+    pub fn to_event<Payload, IP>(&self) -> Result<Event<Payload, IP>>
     where
         Payload: DeserializeOwned,
-        IP: Clone,
+        IP: DeserializeOwned,
     {
-        let event = match self {
+        let event: Event<Payload, IP> = match self {
             ToEvent::Message(e) => {
-                let body: Result<Payload, _> = serde_json::from_value(e.body.payload.clone());
-                if let Ok(body) = body {
-                    let message = Message {
-                        src: e.src.clone(),
-                        dst: e.dst.clone(),
-                        body: Body {
-                            id: e.body.id,
-                            in_reply_to: e.body.in_reply_to,
-                            payload: body,
-                        },
-                    };
-                    Event::Message(message)
-                } else {
-                    Event::Arbitrary(e.clone())
-                }
+                let body: Payload = serde_json::from_value(e.body.payload.clone())?;
+                let message = Message {
+                    src: e.src.clone(),
+                    dst: e.dst.clone(),
+                    body: Body {
+                        id: e.body.id,
+                        in_reply_to: e.body.in_reply_to,
+                        payload: body,
+                    },
+                };
+                Event::Message(message)
             }
-            ToEvent::Injected(i) => Event::Injected(i.clone()),
+            ToEvent::Injected(i) => {
+                let injected: IP = serde_json::from_value(i.clone())?;
+                Event::Injected(injected)
+            }
             ToEvent::Eof => Event::Eof,
         };
         Ok(event)
@@ -200,26 +201,23 @@ impl<IP> ToEvent<IP> {
 }
 
 #[derive(Clone)]
-pub struct Context<IP> {
+pub struct Context {
     /// Allows sending messages as RPCs
     msg_out_tx: Sender<Box<dyn erased_serde::Serialize + Send + Sync + 'static>>,
 
     /// Allows injecting messages into the event loop
-    msg_in_tx: Sender<ToEvent<IP>>,
+    msg_in_tx: Sender<ToEvent>,
 
     /// The id of the next message to be sent.
     msg_id: Arc<AtomicUsize>,
 }
 
-impl<IP> Context<IP> {
+impl Context {
     pub fn new(
-        msg_in_tx: Sender<ToEvent<IP>>,
+        msg_in_tx: Sender<ToEvent>,
         msg_out_tx: Sender<Box<dyn erased_serde::Serialize + Send + Sync>>,
         msg_id: Arc<AtomicUsize>,
-    ) -> Self
-    where
-        IP: Clone + Send + 'static,
-    {
+    ) -> Self {
         Self {
             msg_out_tx,
             msg_in_tx,
@@ -231,22 +229,24 @@ impl<IP> Context<IP> {
         self.msg_id.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn send<S>(&self, s: S) -> anyhow::Result<()>
+    pub fn send<S>(&self, s: S) -> Result<()>
     where
         S: Serialize + Sync + Send + 'static,
     {
-        self.msg_out_tx
-            .send(Box::new(s))
-            .context("send message to stdout")
+        Ok(self.msg_out_tx.send(Box::new(s)).into_diagnostic()?)
+        // .context("send message to stdout")
     }
 
-    pub fn inject(&self, s: IP) -> anyhow::Result<()>
+    pub fn inject<IP>(&self, s: IP) -> Result<()>
     where
-        IP: Sync + Send + 'static,
+        IP: Serialize + Sync + Send + 'static,
     {
-        self.msg_in_tx
-            .send(ToEvent::Injected(s))
-            .context("inject message into event loop")
+        let value: Value = serde_json::to_value(s)?;
+        Ok(self
+            .msg_in_tx
+            .send(ToEvent::Injected(value))
+            .into_diagnostic()
+            .context("inject message into event loop")?)
     }
 
     pub fn next_msg_id(&self) -> usize {
@@ -274,7 +274,7 @@ impl<IP> Context<IP> {
         }
     }
 
-    pub fn send_rpc<Payload>(&self, msg: Message<Payload>) -> anyhow::Result<()>
+    pub fn send_rpc<Payload>(&self, msg: Message<Payload>) -> Result<()>
     where
         Payload: Serialize + Sync + Send + 'static,
     {
