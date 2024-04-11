@@ -287,6 +287,7 @@ pub struct MessageSet<Payload> {
     messages: HashMap<usize, Message<Payload>>,
 
     /// The count of messages that were sent.
+    #[allow(dead_code)]
     count: usize,
 }
 

@@ -1,22 +1,22 @@
-use std::{collections::HashMap, marker::PhantomData};
+// use std::{collections::HashMap, marker::PhantomData};
 
-use anyhow::Context as _;
-use serde::{de::DeserializeOwned, Serialize};
+// use miette::Context as _;
+// use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{Handler, Message};
+// use crate::{Handler, Message};
 
-type HandlerFunc<Payload> = fn(Message<Payload>, Payload) -> Option<Message<Payload>>;
+// type HandlerFunc<Payload> = fn(Message<Payload>, Payload) -> Option<Message<Payload>>;
 
-pub struct RpcHandler<Payload> {
-    callbacks: HashMap<usize, CallbackData<Payload>>,
-    state: PhantomData<Payload>,
-}
+// pub struct RpcHandler<Payload> {
+//     callbacks: HashMap<usize, CallbackData<Payload>>,
+//     state: PhantomData<Payload>,
+// }
 
-#[derive(Debug, Clone)]
-struct CallbackData<Payload> {
-    reply_to: Message<Payload>,
-    callback: Box<HandlerFunc<Payload>>,
-}
+// #[derive(Debug, Clone)]
+// struct CallbackData<Payload> {
+//     reply_to: Message<Payload>,
+//     callback: Box<HandlerFunc<Payload>>,
+// }
 
 // impl<Payload> Handler for RpcHandler<Payload>
 // where
