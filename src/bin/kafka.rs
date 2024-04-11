@@ -4,7 +4,7 @@ use base64::{
     engine::{GeneralPurpose, GeneralPurposeConfig},
     Engine,
 };
-use miette::{bail, Context as _, IntoDiagnostic};
+use miette::{Context as _, IntoDiagnostic};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sloggers::{terminal::TerminalLoggerBuilder, Build as _};
@@ -422,6 +422,6 @@ impl KafkaNode {
 
 impl KafkaNode {}
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     Ok(Runtime::new().run::<_, Payload, InjectedPayload, KafkaNode>(())?)
 }

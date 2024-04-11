@@ -10,7 +10,6 @@ name = "vorticity"
 crate-type = ["rlib"]
 
 [dependencies]
-anyhow = "1.0.80"
 base64 = "0.22.0"
 erased-serde = "0.4.4"
 rand = "0.9"
