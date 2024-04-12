@@ -7,11 +7,11 @@ use miette::{miette, Context as _, IntoDiagnostic};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Default)]
 pub struct MessageBuilder<Payload> {
-    src: Option<String>,
+    src: String,
     dst: Option<String>,
     id: Option<usize>,
     in_reply_to: Option<usize>,
@@ -19,9 +19,9 @@ pub struct MessageBuilder<Payload> {
 }
 
 impl<Payload> MessageBuilder<Payload> {
-    pub fn new() -> Self {
+    pub fn new(src: &str) -> Self {
         Self {
-            src: None,
+            src: src.to_string(),
             dst: None,
             id: None,
             in_reply_to: None,
@@ -29,13 +29,8 @@ impl<Payload> MessageBuilder<Payload> {
         }
     }
 
-    pub fn src(mut self, src: String) -> Self {
-        self.src = Some(src);
-        self
-    }
-
-    pub fn dst(mut self, dst: String) -> Self {
-        self.dst = Some(dst);
+    pub fn dst(mut self, dst: &str) -> Self {
+        self.dst = Some(dst.to_string());
         self
     }
 
@@ -56,12 +51,10 @@ impl<Payload> MessageBuilder<Payload> {
 
     pub fn build(self) -> Result<Message<Payload>> {
         Ok(Message {
-            src: self
-                .src
-                .ok_or(miette!("src is required to build a message"))?,
+            src: self.src,
             dst: self
                 .dst
-                .ok_or(miette!("dst is required to build a message"))?,
+                .ok_or(miette!("src is required to build a message"))?,
             body: Body {
                 id: self.id,
                 in_reply_to: self.in_reply_to,
@@ -86,9 +79,46 @@ pub struct Message<Payload> {
     body: Body<Payload>,
 }
 
-impl<Payload> Message<Payload> {
-    pub fn builder() -> MessageBuilder<Payload> {
-        MessageBuilder::new()
+impl<Payload> Message<Payload>
+where
+    Payload: Clone + Serialize + for<'de> Deserialize<'de>,
+{
+    pub fn to_value(&self) -> Message<Value> {
+        let payload: Value = serde_json::to_value(self.body.payload.clone())
+            .expect("serializable should always convert to value");
+        let msg = Message {
+            body: Body {
+                payload,
+                id: self.body.id,
+                in_reply_to: self.body.in_reply_to,
+            },
+            src: self.src.clone(),
+            dst: self.dst.clone(),
+        };
+        msg
+    }
+
+    pub fn to_payload(msg: &Message<Value>) -> Result<Self> {
+        let payload: Payload = serde_json::from_value(msg.body.payload.clone())?;
+        let msg = Message {
+            body: Body {
+                payload,
+                id: msg.body.id,
+                in_reply_to: msg.body.in_reply_to,
+            },
+            src: msg.src.clone(),
+            dst: msg.dst.clone(),
+        };
+        Ok(msg)
+    }
+}
+
+impl<Payload> Message<Payload>
+where
+    Payload: Clone,
+{
+    pub fn builder(ctx: Context) -> MessageBuilder<Payload> {
+        MessageBuilder::new(&ctx.node_id)
     }
 
     pub fn src(&self) -> &str {
@@ -170,13 +200,30 @@ pub enum ToEvent {
     Eof,
 }
 
-impl ToEvent {
-    pub fn to_event<Payload, IP>(&self) -> Result<Event<Payload, IP>>
-    where
-        Payload: DeserializeOwned,
-        IP: DeserializeOwned,
-    {
-        let event: Event<Payload, IP> = match self {
+impl<Payload> From<Event<Payload>> for ToEvent
+where
+    Payload: Clone + Serialize + for<'de> Deserialize<'de>,
+{
+    fn from(value: Event<Payload>) -> Self {
+        match value {
+            Event::Message(m) => Self::Message(m.to_value()),
+            Event::Injected(i) => Self::Injected(
+                serde_json::to_value(i).expect("serializable should always convert to value"),
+            ),
+            Event::Eof => Self::Eof,
+        }
+    }
+}
+
+impl<Payload, IP> TryFrom<ToEvent> for Event<Payload, IP>
+where
+    Payload: DeserializeOwned,
+    IP: DeserializeOwned,
+{
+    type Error = Error;
+
+    fn try_from(value: ToEvent) -> Result<Self> {
+        let event: Event<Payload, IP> = match value {
             ToEvent::Message(e) => {
                 let body: Payload = serde_json::from_value(e.body.payload.clone())?;
                 let message = Message {
@@ -202,6 +249,8 @@ impl ToEvent {
 
 #[derive(Clone)]
 pub struct Context {
+    node_id: String,
+
     /// Allows sending messages as RPCs
     msg_out_tx: Sender<Box<dyn erased_serde::Serialize + Send + Sync + 'static>>,
 
@@ -214,11 +263,13 @@ pub struct Context {
 
 impl Context {
     pub fn new(
+        node_id: &str,
         msg_in_tx: Sender<ToEvent>,
         msg_out_tx: Sender<Box<dyn erased_serde::Serialize + Send + Sync>>,
         msg_id: Arc<AtomicUsize>,
     ) -> Self {
         Self {
+            node_id: node_id.to_string(),
             msg_out_tx,
             msg_in_tx,
             msg_id,
@@ -233,8 +284,21 @@ impl Context {
     where
         S: Serialize + Sync + Send + 'static,
     {
-        Ok(self.msg_out_tx.send(Box::new(s)).into_diagnostic()?)
-        // .context("send message to stdout")
+        Ok(self
+            .msg_out_tx
+            .send(Box::new(s))
+            .into_diagnostic()
+            .context("send message to stdout")?)
+    }
+
+    pub fn send_set<Payload>(&self, set: &MessageSet<Payload>) -> Result<()>
+    where
+        Payload: Serialize + Clone + Sync + Send + 'static,
+    {
+        for msg in set.messages.values() {
+            self.send(msg.clone())?;
+        }
+        Ok(())
     }
 
     pub fn inject<IP>(&self, s: IP) -> Result<()>
@@ -274,11 +338,8 @@ impl Context {
         }
     }
 
-    pub fn send_rpc<Payload>(&self, msg: Message<Payload>) -> Result<()>
-    where
-        Payload: Serialize + Sync + Send + 'static,
-    {
-        self.send(msg)
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 }
 
@@ -293,7 +354,7 @@ pub struct MessageSet<Payload> {
 
 impl<Payload> MessageSet<Payload>
 where
-    Payload: Clone,
+    Payload: Clone + Serialize,
 {
     pub fn new(msgs: &[Message<Payload>]) -> Self {
         let messages = msgs

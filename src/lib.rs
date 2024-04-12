@@ -2,6 +2,7 @@ use std::{
     any::TypeId,
     collections::HashMap,
     io::{BufRead, Write},
+    rc::Rc,
     sync::{
         atomic::AtomicUsize,
         mpsc::{Receiver, Sender},
@@ -14,7 +15,7 @@ use erased_serde::Serialize;
 use miette::Context as _;
 use serde::{de::DeserializeOwned, Deserialize};
 
-use error::Result;
+use error::{Error, Result};
 pub use message::{Body, Context, Event, Init, Message};
 use message::{InitPayload, ToEvent};
 
@@ -23,10 +24,8 @@ pub mod message;
 pub mod rpc;
 
 pub trait Handler {
-    fn can_handle(&self, json: ToEvent) -> bool;
-    fn step(self: Arc<Self>, json: ToEvent, ctx: Context) -> Result<()>
-    where
-        Self: Sized;
+    fn can_handle(&self, json: &ToEvent) -> bool;
+    fn step(&self, json: ToEvent, ctx: Context) -> Result<()>;
 }
 
 pub trait Node<S, Payload, InjectedPayload = ()> {
@@ -46,7 +45,7 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
 }
 
 pub struct Runtime {
-    handlers: HashMap<TypeId, Arc<dyn Handler>>,
+    handlers: HashMap<TypeId, Rc<dyn Handler>>,
 }
 
 impl Runtime {
@@ -60,16 +59,16 @@ impl Runtime {
     where
         H: Handler + 'static,
     {
-        self.handlers.insert(TypeId::of::<H>(), Arc::new(handler));
+        self.handlers.insert(TypeId::of::<H>(), Rc::new(handler));
         Ok(())
     }
 
-    pub fn get_handler<H>(&self) -> Option<Arc<dyn Handler>>
+    pub fn get_handler<H>(&self) -> Option<Rc<dyn Handler>>
     where
         H: Handler + 'static,
     {
         let get = self.handlers.get(&TypeId::of::<H>());
-        get.map(Arc::clone)
+        get.map(Rc::clone)
     }
 
     pub fn run<S, P, IP, N>(self, init_state: S) -> Result<()>
@@ -83,13 +82,8 @@ impl Runtime {
 
         let (msg_out_tx, msg_out_rx) = std::sync::mpsc::channel();
 
-        let context = Context::new(
-            msg_in_tx.clone(),
-            msg_out_tx.clone(),
-            Arc::new(AtomicUsize::new(0)),
-        );
-
-        let node: N = self.init_node(init_state, context.clone())?;
+        let (node, context): (N, Context) =
+            self.init_node(init_state, msg_in_tx.clone(), msg_out_tx.clone())?;
         let node = node;
 
         std::thread::scope(|scope| -> Result<()> {
@@ -97,13 +91,18 @@ impl Runtime {
             receive_loop(scope, stdin_tx, msg_in_tx);
 
             send_loop(scope, msg_out_rx);
-            event_loop(msg_in_rx, node, context)
+            event_loop(&self, msg_in_rx, node, context)
         })?;
 
         Ok(())
     }
 
-    fn init_node<S, P, IP, N>(&self, init_state: S, context: Context) -> Result<N>
+    fn init_node<S, P, IP, N>(
+        &self,
+        init_state: S,
+        msg_in_tx: Sender<ToEvent>,
+        msg_out_tx: Sender<Box<dyn Serialize + Send + Sync>>,
+    ) -> Result<(N, Context)>
     where
         P: DeserializeOwned + Send + 'static,
         N: Node<S, P, IP>,
@@ -117,12 +116,19 @@ impl Runtime {
         let InitPayload::Init(ref init) = init_msg.body().payload else {
             panic!("first message should be init")
         };
+
+        let context = Context::new(
+            &init.node_id,
+            msg_in_tx,
+            msg_out_tx,
+            Arc::new(AtomicUsize::new(0)),
+        );
         let node = N::from_init(self, init_state, init, context.clone())
             .context("node initialization failed")?;
         let reply = context.construct_reply(&init_msg, InitPayload::InitOk);
 
         context.send(reply)?;
-        Ok(node)
+        Ok((node, context))
     }
 }
 
@@ -177,6 +183,7 @@ fn send_loop<'s, 'env>(
 }
 
 fn event_loop<N, S, P, IP>(
+    runtime: &Runtime,
     msg_in_rx: Receiver<ToEvent>,
     mut node: N,
     context: Context,
@@ -187,7 +194,7 @@ where
     IP: for<'de> Deserialize<'de> + Send + 'static,
 {
     for input in msg_in_rx {
-        if let Ok(input) = input.to_event::<P, IP>() {
+        if let Ok(input) = Event::<P, IP>::try_from(input.clone()) {
             if input.is_reply() {
                 // TODO: Figure out how to get original Message from our RPC system
                 node.handle_reply(input, context.clone())?;
@@ -195,10 +202,11 @@ where
             }
             node.step(input, context.clone())?;
         } else {
-            let ToEvent::Message(message) = input else {
-                panic!("Impossible position");
+            let handler = runtime.handlers.values().find(|h| h.can_handle(&input));
+            let Some(handler) = handler else {
+                return Err(Error::NoHandler(input));
             };
-            todo!("Handle message: {:?}", message);
+            handler.step(input, context.clone())?;
         }
     }
 

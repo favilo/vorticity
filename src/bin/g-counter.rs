@@ -35,7 +35,6 @@ enum InjectedPayload {
 }
 
 pub struct GCounterNode {
-    node_id: String,
     doc: yrs::Doc,
     counter: yrs::MapRef,
     known: HashMap<String, yrs::StateVector>,
@@ -128,9 +127,8 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                         );
                         eprintln!("sending diff to {}: {} bytes", n, diff.len());
                         ctx.send(
-                            Message::builder()
-                                .src(self.node_id.clone())
-                                .dst(n.clone())
+                            Message::builder(ctx.clone())
+                                .dst(n)
                                 .payload(Payload::Gossip { state_vector, diff })
                                 .build()?,
                         )
@@ -169,7 +167,6 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
             .cloned()
             .collect();
         Ok(Self {
-            node_id: init.node_id.clone(),
             doc,
             counter,
             known: init

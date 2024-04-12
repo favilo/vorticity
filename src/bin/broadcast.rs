@@ -48,7 +48,6 @@ enum InjectedPayload {
 }
 
 pub struct BroadcastNode {
-    node_id: String,
     doc: yrs::Doc,
     messages: yrs::ArrayRef,
     known: HashMap<String, yrs::StateVector>,
@@ -135,9 +134,8 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         eprintln!("sending diff to {}: {} bytes", n, diff.len());
 
                         ctx.send(
-                            Message::builder()
-                                .src(self.node_id.clone())
-                                .dst(n.clone())
+                            Message::builder(ctx.clone())
+                                .dst(n)
                                 .payload(Payload::Gossip { state_vector, diff })
                                 .build()?,
                         )
@@ -171,11 +169,11 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         let neighborhood = init
             .node_ids
             .iter()
+            .filter(|&id| id != &init.node_id)
             .filter(|&_| rng.gen_bool(0.75))
             .cloned()
             .collect();
         Ok(Self {
-            node_id: init.node_id.clone(),
             doc,
             messages,
             known: init

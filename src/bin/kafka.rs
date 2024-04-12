@@ -8,11 +8,7 @@ use miette::{Context as _, IntoDiagnostic};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sloggers::{terminal::TerminalLoggerBuilder, Build as _};
-use vorticity::{
-    error::Result,
-    message::{Init, MessageSet},
-    Context, Event, Message, Node, Runtime,
-};
+use vorticity::{error::Result, message::Init, Context, Event, Message, Node, Runtime};
 use yrs::{
     types::ToJson,
     updates::{decoder::Decode, encoder::Encode},
@@ -25,48 +21,6 @@ const ENGINE: GeneralPurpose =
     GeneralPurpose::new(&base64::alphabet::URL_SAFE, GeneralPurposeConfig::new());
 
 type Msg = yrs::Any;
-
-enum CallbackStatus {
-    MoreWork,
-    Finished,
-}
-
-type RpcCallback = dyn Fn(
-    &Message<Payload>,
-    &mut MessageSet<Payload>,
-    &Message<Payload>,
-    Context,
-) -> Result<CallbackStatus>;
-
-struct CallbackInfo {
-    unhandled_incoming_msg: Message<Payload>,
-    sent_msgs: MessageSet<Payload>,
-    callback: Box<RpcCallback>,
-}
-
-impl CallbackInfo {
-    fn new(
-        orig_msg: Message<Payload>,
-        sent_msgs: MessageSet<Payload>,
-        callback: impl Fn(
-                &Message<Payload>,
-                &mut MessageSet<Payload>,
-                &Message<Payload>,
-                Context,
-            ) -> Result<CallbackStatus>
-            + 'static,
-    ) -> Self {
-        Self {
-            unhandled_incoming_msg: orig_msg,
-            sent_msgs,
-            callback: Box::new(callback),
-        }
-    }
-
-    fn matches(&self, msg: &Message<Payload>) -> bool {
-        self.sent_msgs.is_matching_reply(msg) && self.unhandled_incoming_msg.dst() == msg.dst()
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -118,14 +72,11 @@ enum InjectedPayload {
 }
 
 pub struct KafkaNode {
-    node_id: String,
     doc: yrs::Doc,
     logs: yrs::MapRef,
     offsets: yrs::MapRef,
     known: HashMap<String, yrs::StateVector>,
     neighborhood: Vec<String>,
-
-    callbacks: Vec<CallbackInfo>,
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
@@ -192,11 +143,11 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         let neighborhood = init
             .node_ids
             .iter()
+            .filter(|&id| id != &init.node_id)
             .filter(|&_| rng.gen_bool(0.75))
             .cloned()
             .collect();
         Ok(Self {
-            node_id: init.node_id.clone(),
             doc,
             logs,
             offsets,
@@ -207,40 +158,20 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                 .map(|nid| (nid, Default::default()))
                 .collect(),
             neighborhood,
-            callbacks: Vec::new(),
         })
     }
 
     fn handle_reply(
         &mut self,
         input: Event<Payload, InjectedPayload>,
-        context: Context,
+        _context: Context,
     ) -> Result<()> {
         // TODO: Make this handle callbacks stored in a data structure
-        let Event::Message(input) = input else {
+        let Event::Message(_input) = input else {
             return Err(miette::miette!("expected Message").into());
         };
 
-        let callback = self
-            .callbacks
-            .iter_mut()
-            .find(|c| c.matches(&input))
-            .ok_or(miette::miette!("Reply to message we don't have: {input:?}"))?;
-        let f = &callback.callback;
-        let status = f(
-            &callback.unhandled_incoming_msg,
-            &mut callback.sent_msgs,
-            &input,
-            context,
-        )
-        .context("Running callback caused an error")?;
-
-        match status {
-            CallbackStatus::MoreWork => {}
-            CallbackStatus::Finished => self.callbacks.retain(|c| !c.matches(&input)),
-        }
-
-        Ok(())
+        todo!("handle replies?");
     }
 }
 
@@ -256,9 +187,6 @@ impl KafkaNode {
 
     fn send_gossip(&mut self, ctx: &Context) -> Result<()> {
         for n in &self.neighborhood {
-            if n == &self.node_id {
-                continue;
-            }
             let remote_state_vector = &self.known[n];
             let txn = self.doc.transact();
             let diff = ENGINE.encode(&txn.encode_diff_v1(remote_state_vector));
@@ -277,9 +205,8 @@ impl KafkaNode {
             );
             eprintln!("sending diff to {}: {} bytes", n, diff.len());
             ctx.send(
-                Message::builder()
-                    .src(self.node_id.clone())
-                    .dst(n.clone())
+                Message::builder(ctx.clone())
+                    .dst(n)
                     .payload(Payload::Admin(AdminPayload::Gossip { state_vector, diff }))
                     .build()?,
             )
