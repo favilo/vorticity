@@ -42,5 +42,5 @@ impl Node<(), Payload> for UniqueNode {
 }
 
 fn main() -> Result<()> {
-    Ok(Runtime::new().run::<_, _, _, UniqueNode>(())?)
+    Runtime::new().run::<_, _, _, UniqueNode>(())
 }

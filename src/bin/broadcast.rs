@@ -189,5 +189,5 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
 }
 
 fn main() -> Result<()> {
-    Ok(Runtime::new().run::<_, Payload, InjectedPayload, BroadcastNode>(())?)
+    Runtime::new().run::<_, Payload, InjectedPayload, BroadcastNode>(())
 }

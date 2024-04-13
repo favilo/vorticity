@@ -351,5 +351,5 @@ impl KafkaNode {
 impl KafkaNode {}
 
 fn main() -> Result<()> {
-    Ok(Runtime::new().run::<_, Payload, InjectedPayload, KafkaNode>(())?)
+    Runtime::new().run::<_, Payload, InjectedPayload, KafkaNode>(())
 }
