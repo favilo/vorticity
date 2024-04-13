@@ -113,7 +113,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         Ok(())
     }
 
-    fn from_init(_runtime: &Runtime, _state: (), init: &Init, context: Context) -> Result<Self>
+    fn init(runtime: &Runtime, _state: (), context: Context) -> Result<Self>
     where
         Self: Sized,
     {
@@ -125,12 +125,13 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             .build()
             .into_diagnostic()
             .context("failed to build logger")?;
+        let inner_context = context.clone();
         std::thread::spawn(move || {
             // generate gossip events
             // TODO: handle EOF signal
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                if context.inject(InjectedPayload::Gossip).is_err() {
+                if inner_context.inject(InjectedPayload::Gossip).is_err() {
                     break;
                 }
             }
@@ -140,10 +141,10 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         let logs = doc.get_or_insert_map("counter");
         let offsets = doc.get_or_insert_map("offsets");
         let mut rng = rand::thread_rng();
-        let neighborhood = init
-            .node_ids
+        let neighborhood = context
+            .neighbors()
             .iter()
-            .filter(|&id| id != &init.node_id)
+            .filter(|&id| id != context.node_id())
             .filter(|&_| rng.gen_bool(0.75))
             .cloned()
             .collect();
@@ -151,8 +152,8 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             doc,
             logs,
             offsets,
-            known: init
-                .node_ids
+            known: context
+                .neighbors()
                 .iter()
                 .cloned()
                 .map(|nid| (nid, Default::default()))

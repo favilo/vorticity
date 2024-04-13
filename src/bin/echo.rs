@@ -30,7 +30,7 @@ impl Node<(), Payload> for EchoNode {
         Ok(())
     }
 
-    fn from_init(_runtime: &Runtime, _state: (), _init: &Init, _ctx: Context) -> Result<Self>
+    fn init(_runtime: &Runtime, _state: (), _ctx: Context) -> Result<Self>
     where
         Self: Sized,
     {

@@ -19,13 +19,26 @@ pub struct LinKv {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum LinKvPayload {
-    Read { key: String },
-    ReadOk { value: Value },
+    Read {
+        key: String,
+    },
+    ReadOk {
+        value: Value,
+    },
 
-    Write { key: String, value: Value },
+    Write {
+        key: String,
+        value: Value,
+    },
     WriteOk,
 
-    Cas { key: String, from: Value, to: Value },
+    Cas {
+        key: String,
+        from: Value,
+        to: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        create_if_not_exists: Option<bool>,
+    },
     CasOk,
 }
 
