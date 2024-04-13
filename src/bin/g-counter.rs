@@ -7,7 +7,7 @@ use base64::{
 use miette::{Context as _, IntoDiagnostic};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{error::Result, Context, Event, Init, Message, Node, Runtime};
+use vorticity::{error::Result, Context, Event, Message, Node, Runtime};
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     Map, ReadTxn, Transact,

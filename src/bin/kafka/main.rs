@@ -8,7 +8,7 @@ use miette::{Context as _, IntoDiagnostic};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sloggers::{terminal::TerminalLoggerBuilder, Build as _};
-use vorticity::{error::Result, message::Init, Context, Event, Message, Node, Runtime};
+use vorticity::{error::Result, Context, Event, Message, Node, Runtime};
 use yrs::{
     types::ToJson,
     updates::{decoder::Decode, encoder::Encode},
@@ -113,7 +113,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         Ok(())
     }
 
-    fn init(runtime: &Runtime, _state: (), context: Context) -> Result<Self>
+    fn init(_runtime: &Runtime, _state: (), context: Context) -> Result<Self>
     where
         Self: Sized,
     {

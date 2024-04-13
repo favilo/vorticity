@@ -1,6 +1,6 @@
 use miette::Context as _;
 use serde::{Deserialize, Serialize};
-use vorticity::{error::Result, Context, Event, Init, Node, Runtime};
+use vorticity::{error::Result, Context, Event, Node, Runtime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
