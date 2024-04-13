@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{any::Any, cell::RefCell};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,6 +63,8 @@ impl Handler for LinKv {
     }
 }
 
+pub type ReadCallback<Payload> = dyn Fn(Message<Payload>, &mut dyn Any, Value, Context);
+
 impl LinKv {
     fn handle_read_ok(&self, event: &Message<LinKvPayload>, ctx: Context) -> Result<()> {
         let mut borrow = self.callbacks.borrow_mut();
@@ -86,13 +88,15 @@ impl LinKv {
         &self,
         key: &str,
         orig_msg: &Message<Payload>,
-        callback: Box<dyn Fn(Message<Payload>, Value, Context)>,
+        state: Box<dyn Any>,
+        callback: Box<ReadCallback<Payload>>,
         ctx: Context,
     ) -> Result<()>
     where
         Payload: Clone + Serialize + for<'de> Deserialize<'de> + 'static,
     {
         let process_callback = move |orig_msg: &Message<Value>,
+                                     state: &mut dyn Any,
                                      _set: &mut MessageSet<LinKvPayload>,
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
@@ -100,7 +104,7 @@ impl LinKv {
             let LinKvPayload::ReadOk { value } = msg.body().payload.clone() else {
                 return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
             };
-            callback(Message::to_payload(orig_msg)?, value, ctx);
+            callback(Message::to_payload(orig_msg)?, state, value, ctx);
             Ok(CallbackStatus::Finished)
         };
 
@@ -113,7 +117,7 @@ impl LinKv {
             .build()?]);
         ctx.send_set(&msg_set)?;
         let callback_info =
-            CallbackInfo::new(orig_msg.clone(), msg_set, Box::new(process_callback));
+            CallbackInfo::new(orig_msg.clone(), state, msg_set, Box::new(process_callback));
 
         self.callbacks.borrow_mut().push(callback_info);
 

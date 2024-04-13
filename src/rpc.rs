@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,6 +14,7 @@ pub enum CallbackStatus {
 
 pub type RpcCallback<RpcPayload> = dyn Fn(
     &Message<Value>,
+    &mut dyn Any,
     &mut MessageSet<RpcPayload>,
     &Message<RpcPayload>,
     Context,
@@ -19,6 +22,7 @@ pub type RpcCallback<RpcPayload> = dyn Fn(
 
 pub struct CallbackInfo<RpcPayload> {
     unhandled_incoming_msg: Message<Value>,
+    state: Box<dyn Any>,
     sent_msgs: MessageSet<RpcPayload>,
     callback: Box<RpcCallback<RpcPayload>>,
 }
@@ -29,6 +33,7 @@ where
 {
     fn new<Payload>(
         orig_msg: Message<Payload>,
+        state: Box<dyn Any>,
         sent_msgs: MessageSet<RpcPayload>,
         callback: Box<RpcCallback<RpcPayload>>,
     ) -> Self
@@ -37,6 +42,7 @@ where
     {
         Self {
             unhandled_incoming_msg: orig_msg.to_value(),
+            state,
             sent_msgs,
             callback: Box::new(callback),
         }
@@ -47,6 +53,12 @@ where
     }
 
     pub fn call(&mut self, msg: &Message<RpcPayload>, ctx: Context) -> Result<CallbackStatus> {
-        (self.callback)(&self.unhandled_incoming_msg, &mut self.sent_msgs, msg, ctx)
+        (self.callback)(
+            &self.unhandled_incoming_msg,
+            &mut self.state,
+            &mut self.sent_msgs,
+            msg,
+            ctx,
+        )
     }
 }
