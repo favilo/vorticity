@@ -13,9 +13,7 @@ pub enum Payload {
     },
 }
 
-pub struct UniqueNode {
-    pub node: String,
-}
+pub struct UniqueNode;
 
 impl Node<(), Payload> for UniqueNode {
     fn step(&mut self, input: Event<Payload>, ctx: Context) -> Result<()> {
@@ -24,7 +22,7 @@ impl Node<(), Payload> for UniqueNode {
         };
         match input.body().payload {
             Payload::Generate => {
-                let guid = format!("{}-{}", self.node, ctx.msg_id());
+                let guid = format!("{}-{}", ctx.node_id(), ctx.msg_id());
                 let reply = ctx.construct_reply(&input, Payload::GenerateOk { guid });
 
                 ctx.send(reply).context("serialize response to generate")?;
@@ -35,13 +33,11 @@ impl Node<(), Payload> for UniqueNode {
         Ok(())
     }
 
-    fn from_init(_runtime: &Runtime, _state: (), init: &Init, _ctx: Context) -> Result<Self>
+    fn init(_runtime: &Runtime, _state: (), _ctx: Context) -> Result<Self>
     where
         Self: Sized,
     {
-        Ok(Self {
-            node: init.node_id.clone(),
-        })
+        Ok(Self)
     }
 }
 

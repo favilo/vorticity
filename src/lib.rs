@@ -29,7 +29,7 @@ pub trait Handler {
 }
 
 pub trait Node<S, Payload, InjectedPayload = ()> {
-    fn from_init(runtime: &Runtime, state: S, init: &Init, context: Context) -> Result<Self>
+    fn init(runtime: &Runtime, state: S, context: Context) -> Result<Self>
     where
         Self: Sized;
 
@@ -119,12 +119,13 @@ impl Runtime {
 
         let context = Context::new(
             &init.node_id,
+            &init.node_ids,
             msg_in_tx,
             msg_out_tx,
             Arc::new(AtomicUsize::new(0)),
         );
-        let node = N::from_init(self, init_state, init, context.clone())
-            .context("node initialization failed")?;
+        let node =
+            N::init(self, init_state, context.clone()).context("node initialization failed")?;
         let reply = context.construct_reply(&init_msg, InitPayload::InitOk);
 
         context.send(reply)?;

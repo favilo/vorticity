@@ -249,7 +249,11 @@ where
 
 #[derive(Clone)]
 pub struct Context {
-    node_id: String,
+    /// The id of the node.
+    node_id: Arc<String>,
+
+    /// The ids of the nodes that are connected to this node.
+    nodes: Arc<Vec<String>>,
 
     /// Allows sending messages as RPCs
     msg_out_tx: Sender<Box<dyn erased_serde::Serialize + Send + Sync + 'static>>,
@@ -264,12 +268,14 @@ pub struct Context {
 impl Context {
     pub fn new(
         node_id: &str,
+        nodes: &[String],
         msg_in_tx: Sender<ToEvent>,
         msg_out_tx: Sender<Box<dyn erased_serde::Serialize + Send + Sync>>,
         msg_id: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            node_id: node_id.to_string(),
+            node_id: Arc::new(node_id.to_string()),
+            nodes: Arc::new(nodes.to_owned()),
             msg_out_tx,
             msg_in_tx,
             msg_id,
@@ -340,6 +346,10 @@ impl Context {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    pub fn neighbors(&self) -> &[String] {
+        &self.nodes
     }
 }
 
