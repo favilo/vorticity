@@ -84,7 +84,7 @@ impl LinKv {
         let (idx, callback_info) = borrow
             .iter_mut()
             .enumerate()
-            .find(|(_, info)| info.matches(&event))
+            .find(|(_, info)| info.matches(event))
             .ok_or_else(|| Error::NoCallback(event.to_value()))?;
         let status = callback_info.call(event, ctx)?;
         match status {

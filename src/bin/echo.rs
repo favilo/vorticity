@@ -39,5 +39,5 @@ impl Node<(), Payload> for EchoNode {
 }
 
 fn main() -> Result<()> {
-    Ok(Runtime::new().run::<_, _, _, EchoNode>(())?)
+    Runtime::new().run::<_, _, _, EchoNode>(())
 }

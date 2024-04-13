@@ -182,5 +182,5 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
 }
 
 fn main() -> Result<()> {
-    Ok(Runtime::new().run::<_, Payload, InjectedPayload, GCounterNode>(())?)
+    Runtime::new().run::<_, Payload, InjectedPayload, GCounterNode>(())
 }

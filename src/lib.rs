@@ -44,15 +44,14 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
     }
 }
 
+#[derive(Default)]
 pub struct Runtime {
     handlers: HashMap<TypeId, Rc<dyn Handler>>,
 }
 
 impl Runtime {
     pub fn new() -> Self {
-        Self {
-            handlers: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn with_handler<H>(&mut self, handler: H) -> Result<()>
@@ -149,8 +148,8 @@ where
     })
 }
 
-fn receive_loop<'s, 'env>(
-    scope: &'s thread::Scope<'s, 'env>,
+fn receive_loop<'s>(
+    scope: &'s thread::Scope<'s, '_>,
     stdin_tx: Sender<ToEvent>,
     msg_in_tx: Sender<ToEvent>,
 ) -> thread::ScopedJoinHandle<'s, Result<()>> {
@@ -169,8 +168,8 @@ fn receive_loop<'s, 'env>(
     })
 }
 
-fn send_loop<'s, 'env>(
-    scope: &'s thread::Scope<'s, 'env>,
+fn send_loop<'s>(
+    scope: &'s thread::Scope<'s, '_>,
     msg_out_rx: Receiver<Box<dyn Serialize + Send + Sync>>,
 ) -> thread::ScopedJoinHandle<'s, Result<()>> {
     scope.spawn(move || {

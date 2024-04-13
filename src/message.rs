@@ -86,7 +86,7 @@ where
     pub fn to_value(&self) -> Message<Value> {
         let payload: Value = serde_json::to_value(self.body.payload.clone())
             .expect("serializable should always convert to value");
-        let msg = Message {
+        Message {
             body: Body {
                 payload,
                 id: self.body.id,
@@ -94,8 +94,7 @@ where
             },
             src: self.src.clone(),
             dst: self.dst.clone(),
-        };
-        msg
+        }
     }
 
     pub fn to_payload(msg: &Message<Value>) -> Result<Self> {
