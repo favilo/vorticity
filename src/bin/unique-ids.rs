@@ -1,6 +1,6 @@
-use anyhow::Context as _;
+use miette::Context as _;
 use serde::{Deserialize, Serialize};
-use vorticity::{Context, Event, Init, Node, Runtime};
+use vorticity::{error::Result, Context, Event, Node, Runtime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -13,18 +13,16 @@ pub enum Payload {
     },
 }
 
-pub struct UniqueNode {
-    pub node: String,
-}
+pub struct UniqueNode;
 
 impl Node<(), Payload> for UniqueNode {
-    fn step(&mut self, input: Event<Payload>, ctx: Context<()>) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, ctx: Context) -> Result<()> {
         let Event::Message(input) = input else {
             unreachable!();
         };
         match input.body().payload {
             Payload::Generate => {
-                let guid = format!("{}-{}", self.node, ctx.msg_id());
+                let guid = format!("{}-{}", ctx.node_id(), ctx.msg_id());
                 let reply = ctx.construct_reply(&input, Payload::GenerateOk { guid });
 
                 ctx.send(reply).context("serialize response to generate")?;
@@ -35,16 +33,14 @@ impl Node<(), Payload> for UniqueNode {
         Ok(())
     }
 
-    fn from_init(_state: (), init: &Init, _ctx: Context<()>) -> anyhow::Result<Self>
+    fn init(_runtime: &Runtime, _state: (), _ctx: Context) -> Result<Self>
     where
         Self: Sized,
     {
-        Ok(Self {
-            node: init.node_id.clone(),
-        })
+        Ok(Self)
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    Runtime::run::<_, _, _, UniqueNode>(())
+fn main() -> Result<()> {
+    Runtime::new().run::<_, _, _, UniqueNode>(())
 }

@@ -1,16 +1,14 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::{bail, Context as _};
 use base64::{
     engine::{GeneralPurpose, GeneralPurposeConfig},
     Engine,
 };
+use miette::{Context as _, IntoDiagnostic};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use vorticity::{
-    message::{Init, MessageSet},
-    Context, Event, Message, Node, Runtime,
-};
+use sloggers::{terminal::TerminalLoggerBuilder, Build as _};
+use vorticity::{error::Result, Context, Event, Message, Node, Runtime};
 use yrs::{
     types::ToJson,
     updates::{decoder::Decode, encoder::Encode},
@@ -23,48 +21,6 @@ const ENGINE: GeneralPurpose =
     GeneralPurpose::new(&base64::alphabet::URL_SAFE, GeneralPurposeConfig::new());
 
 type Msg = yrs::Any;
-
-enum CallbackStatus {
-    MoreWork,
-    Finished,
-}
-
-type RpcCallback = dyn Fn(
-    &Message<Payload>,
-    &mut MessageSet<Payload>,
-    &Message<Payload>,
-    Context<InjectedPayload>,
-) -> anyhow::Result<CallbackStatus>;
-
-struct CallbackInfo {
-    unhandled_incoming_msg: Message<Payload>,
-    sent_msgs: MessageSet<Payload>,
-    callback: Box<RpcCallback>,
-}
-
-impl CallbackInfo {
-    fn new(
-        orig_msg: Message<Payload>,
-        sent_msgs: MessageSet<Payload>,
-        callback: impl Fn(
-                &Message<Payload>,
-                &mut MessageSet<Payload>,
-                &Message<Payload>,
-                Context<InjectedPayload>,
-            ) -> anyhow::Result<CallbackStatus>
-            + 'static,
-    ) -> Self {
-        Self {
-            unhandled_incoming_msg: orig_msg,
-            sent_msgs,
-            callback: Box::new(callback),
-        }
-    }
-
-    fn matches(&self, msg: &Message<Payload>) -> bool {
-        self.sent_msgs.is_matching_reply(msg) && self.unhandled_incoming_msg.dst() == msg.dst()
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -106,28 +62,25 @@ enum AdminPayload {
     Gossip { diff: String, state_vector: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum InjectedPayload {
+    /// Signal to send gossip to peers.
     Gossip,
+
+    /// Signal to tick the raft node.
+    Tick,
 }
 
 pub struct KafkaNode {
-    node_id: String,
     doc: yrs::Doc,
     logs: yrs::MapRef,
     offsets: yrs::MapRef,
     known: HashMap<String, yrs::StateVector>,
     neighborhood: Vec<String>,
-
-    callbacks: Vec<CallbackInfo>,
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
-    fn step(
-        &mut self,
-        input: Event<Payload, InjectedPayload>,
-        ctx: Context<InjectedPayload>,
-    ) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload, InjectedPayload>, ctx: Context) -> Result<()> {
         match input {
             Event::Message(input) => match input.body().payload {
                 Payload::Send { ref key, ref msg } => {
@@ -155,22 +108,30 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             Event::Injected(input) => {
                 self.handle_injected(input, &ctx)?;
             }
-            Event::Arbitrary(_) => todo!(),
         }
 
         Ok(())
     }
 
-    fn from_init(_state: (), init: &Init, context: Context<InjectedPayload>) -> anyhow::Result<Self>
+    fn init(_runtime: &Runtime, _state: (), context: Context) -> Result<Self>
     where
         Self: Sized,
     {
+        let builder = &mut TerminalLoggerBuilder::new();
+        builder
+            .level(sloggers::types::Severity::Debug)
+            .destination(sloggers::terminal::Destination::Stderr);
+        let _logger = builder
+            .build()
+            .into_diagnostic()
+            .context("failed to build logger")?;
+        let inner_context = context.clone();
         std::thread::spawn(move || {
             // generate gossip events
             // TODO: handle EOF signal
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                if context.inject(InjectedPayload::Gossip).is_err() {
+                if inner_context.inject(InjectedPayload::Gossip).is_err() {
                     break;
                 }
             }
@@ -180,81 +141,53 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         let logs = doc.get_or_insert_map("counter");
         let offsets = doc.get_or_insert_map("offsets");
         let mut rng = rand::thread_rng();
-        let neighborhood = init
-            .node_ids
+        let neighborhood = context
+            .neighbors()
             .iter()
+            .filter(|&id| id != context.node_id())
             .filter(|&_| rng.gen_bool(0.75))
             .cloned()
             .collect();
         Ok(Self {
-            node_id: init.node_id.clone(),
             doc,
             logs,
             offsets,
-            known: init
-                .node_ids
+            known: context
+                .neighbors()
                 .iter()
                 .cloned()
                 .map(|nid| (nid, Default::default()))
                 .collect(),
             neighborhood,
-            callbacks: Vec::new(),
         })
     }
 
     fn handle_reply(
         &mut self,
         input: Event<Payload, InjectedPayload>,
-        context: Context<InjectedPayload>,
-    ) -> anyhow::Result<()> {
+        _context: Context,
+    ) -> Result<()> {
         // TODO: Make this handle callbacks stored in a data structure
-        let Event::Message(input) = input else {
-            bail!("expected Message")
+        let Event::Message(_input) = input else {
+            return Err(miette::miette!("expected Message").into());
         };
 
-        let callback = self
-            .callbacks
-            .iter_mut()
-            .find(|c| c.matches(&input))
-            .ok_or(anyhow::anyhow!("Reply to message we don't have: {input:?}"))?;
-        let f = &callback.callback;
-        let status = f(
-            &callback.unhandled_incoming_msg,
-            &mut callback.sent_msgs,
-            &input,
-            context,
-        )
-        .context("Running callback caused an error")?;
-
-        match status {
-            CallbackStatus::MoreWork => {}
-            CallbackStatus::Finished => self.callbacks.retain(|c| !c.matches(&input)),
-        }
-
-        Ok(())
+        todo!("handle replies?");
     }
 }
 
 impl KafkaNode {
-    fn handle_injected(
-        &mut self,
-        injected: InjectedPayload,
-        ctx: &Context<InjectedPayload>,
-    ) -> anyhow::Result<()> {
+    fn handle_injected(&mut self, injected: InjectedPayload, ctx: &Context) -> Result<()> {
         match injected {
-            InjectedPayload::Gossip => {
-                self.send_gossip(ctx)?;
-            }
+            InjectedPayload::Gossip => self.send_gossip(ctx)?,
+            InjectedPayload::Tick => self.tick(ctx)?,
         };
 
         Ok(())
     }
 
-    fn send_gossip(&mut self, ctx: &Context<InjectedPayload>) -> anyhow::Result<()> {
+    fn send_gossip(&mut self, ctx: &Context) -> Result<()> {
         for n in &self.neighborhood {
-            if n == &self.node_id {
-                continue;
-            }
             let remote_state_vector = &self.known[n];
             let txn = self.doc.transact();
             let diff = ENGINE.encode(&txn.encode_diff_v1(remote_state_vector));
@@ -273,9 +206,8 @@ impl KafkaNode {
             );
             eprintln!("sending diff to {}: {} bytes", n, diff.len());
             ctx.send(
-                Message::builder()
-                    .src(self.node_id.clone())
-                    .dst(n.clone())
+                Message::builder(ctx.clone())
+                    .dst(n)
                     .payload(Payload::Admin(AdminPayload::Gossip { state_vector, diff }))
                     .build()?,
             )
@@ -285,25 +217,28 @@ impl KafkaNode {
         Ok(())
     }
 
-    fn handle_admin(
-        &mut self,
-        input: &Message<Payload>,
-        _ctx: &Context<InjectedPayload>,
-    ) -> anyhow::Result<()> {
+    fn handle_admin(&mut self, input: &Message<Payload>, _ctx: &Context) -> Result<()> {
         let Payload::Admin(admin_payload) = &input.body().payload else {
-            anyhow::bail!("expected Admin payload");
+            return Err(miette::miette!("expected Admin payload").into());
         };
         match admin_payload {
             AdminPayload::Gossip { state_vector, diff } => {
                 let state_vector = yrs::StateVector::decode_v1(
                     &ENGINE
                         .decode(state_vector)
+                        .into_diagnostic()
                         .context("base64 decode failed")?,
                 )
+                .into_diagnostic()
                 .context("StateVector decode failed")?;
-                let update =
-                    yrs::Update::decode_v1(&ENGINE.decode(diff).context("base64 decode failed")?)
-                        .context("Update decode failed")?;
+                let update = yrs::Update::decode_v1(
+                    &ENGINE
+                        .decode(diff)
+                        .into_diagnostic()
+                        .context("base64 decode failed")?,
+                )
+                .into_diagnostic()
+                .context("Update decode failed")?;
                 self.known.insert(input.src().to_string(), state_vector);
                 let mut txn = self.doc.transact_mut();
                 txn.apply_update(update);
@@ -317,9 +252,9 @@ impl KafkaNode {
         &mut self,
         key: &str,
         msg: &yrs::Any,
-        ctx: &Context<InjectedPayload>,
+        ctx: &Context,
         input: &Message<Payload>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<()> {
         let mut txn = self.doc.transact_mut();
         let list = self.logs.get(&txn, key);
         let list = match list {
@@ -345,9 +280,9 @@ impl KafkaNode {
     fn handle_poll(
         &mut self,
         offsets: &HashMap<String, u64>,
-        ctx: &Context<InjectedPayload>,
+        ctx: &Context,
         input: &Message<Payload>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<()> {
         let txn = self.doc.transact();
         let offsets = offsets
             .iter()
@@ -371,9 +306,9 @@ impl KafkaNode {
     fn handle_commit_offsets(
         &mut self,
         offsets: &HashMap<String, u64>,
-        ctx: &Context<InjectedPayload>,
+        ctx: &Context,
         input: &Message<Payload>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<()> {
         let mut txn = self.doc.transact_mut();
         offsets.iter().for_each(|(k, v)| {
             self.offsets.insert(&mut txn, k.clone(), *v as i64);
@@ -386,9 +321,9 @@ impl KafkaNode {
     fn handle_list_committed_offsets(
         &mut self,
         keys: &[String],
-        ctx: &Context<InjectedPayload>,
+        ctx: &Context,
         input: &Message<Payload>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<()> {
         let txn = self.doc.transact();
         let offsets = keys
             .iter()
@@ -407,10 +342,14 @@ impl KafkaNode {
         ctx.send(reply).context("serialize response to commit")?;
         Ok(())
     }
+
+    fn tick(&self, _ctx: &Context) -> Result<()> {
+        todo!()
+    }
 }
 
 impl KafkaNode {}
 
-fn main() -> anyhow::Result<()> {
-    Runtime::run::<_, Payload, InjectedPayload, KafkaNode>(())
+fn main() -> Result<()> {
+    Runtime::new().run::<_, Payload, InjectedPayload, KafkaNode>(())
 }

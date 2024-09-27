@@ -1,6 +1,6 @@
-use anyhow::Context as _;
+use miette::Context as _;
 use serde::{Deserialize, Serialize};
-use vorticity::{Context, Event, Init, Node, Runtime};
+use vorticity::{error::Result, Context, Event, Node, Runtime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -15,7 +15,7 @@ pub struct EchoNode {
 }
 
 impl Node<(), Payload> for EchoNode {
-    fn step(&mut self, input: Event<Payload>, ctx: Context<()>) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, ctx: Context) -> Result<()> {
         let Event::Message(input) = input else {
             unreachable!()
         };
@@ -30,7 +30,7 @@ impl Node<(), Payload> for EchoNode {
         Ok(())
     }
 
-    fn from_init(_state: (), _init: &Init, _ctx: Context<()>) -> anyhow::Result<Self>
+    fn init(_runtime: &Runtime, _state: (), _ctx: Context) -> Result<Self>
     where
         Self: Sized,
     {
@@ -38,6 +38,6 @@ impl Node<(), Payload> for EchoNode {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    Runtime::run::<_, _, _, EchoNode>(())
+fn main() -> Result<()> {
+    Runtime::new().run::<_, _, _, EchoNode>(())
 }
