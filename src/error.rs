@@ -32,6 +32,12 @@ pub enum Error {
 
     #[error("No callback registered for message: {0:?}")]
     NoCallback(Message<Value>),
+
+    #[error("Not able to downcast handler")]
+    Downcast,
+
+    #[error("Not able to apply update: {0}")]
+    YrsUpdate(#[from] yrs::error::UpdateError),
 }
 
 impl From<miette::Report> for Error {

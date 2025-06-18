@@ -53,6 +53,8 @@ pub enum LinKvPayload {
 
     Cas(Cas),
     CasOk,
+
+    Error { text: String, code: u64 },
 }
 
 impl Handler for LinKv {
@@ -75,9 +77,10 @@ impl Handler for LinKv {
 
         // TODO: figure out errors from lin-kv cas, when there is contention
         match &event.body().payload {
-            LinKvPayload::ReadOk { .. } | LinKvPayload::WriteOk | LinKvPayload::CasOk => {
-                self.handle_reply(&event, ctx)?
-            }
+            LinKvPayload::ReadOk { .. }
+            | LinKvPayload::WriteOk
+            | LinKvPayload::CasOk
+            | LinKvPayload::Error { .. } => self.handle_reply(&event, ctx)?,
 
             LinKvPayload::Write(Write { .. })
             | LinKvPayload::Cas(Cas { .. })
@@ -88,9 +91,10 @@ impl Handler for LinKv {
     }
 }
 
-pub type ReadCallback<Payload> = dyn Fn(Message<Payload>, &mut dyn Any, Value, Context);
-pub type WriteCallback<Payload> = dyn Fn(Message<Payload>, &mut dyn Any, Context);
-pub type CasCallback<Payload> = dyn Fn(Message<Payload>, &mut dyn Any, Context);
+pub type ReadCallback<Payload> =
+    dyn Fn(Message<Payload>, &mut dyn Any, Value, Context) -> Result<()>;
+pub type WriteCallback<Payload> = dyn Fn(Message<Payload>, &mut dyn Any, Context) -> Result<()>;
+pub type CasCallback<Payload> = dyn Fn(Message<Payload>, &mut dyn Any, Context) -> Result<()>;
 
 impl LinKv {
     fn handle_reply(&self, event: &Message<LinKvPayload>, ctx: Context) -> Result<()> {
@@ -103,7 +107,7 @@ impl LinKv {
         let status = callback_info.call(event, ctx)?;
         match status {
             CallbackStatus::Finished => {
-                self.callbacks.borrow_mut().remove(idx);
+                borrow.remove(idx);
             }
             CallbackStatus::MoreWork => {}
         };
@@ -128,10 +132,18 @@ impl LinKv {
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
               -> Result<CallbackStatus> {
-            let LinKvPayload::ReadOk { value } = msg.body().payload.clone() else {
-                return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
+            eprintln!("Read callback: {:?}", msg);
+            let value = match msg.body().payload.clone() {
+                LinKvPayload::ReadOk { value } => value,
+                LinKvPayload::Error { text, code } => {
+                    eprintln!("Key didn't exist error: {}: {}", code, text);
+                    Value::Array(Vec::new())
+                }
+                _ => {
+                    return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
+                }
             };
-            callback(Message::to_payload(orig_msg)?, state, value, ctx);
+            callback(Message::to_payload(orig_msg)?, state, value, ctx)?;
             Ok(CallbackStatus::Finished)
         };
 
@@ -163,10 +175,11 @@ impl LinKv {
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
               -> Result<CallbackStatus> {
+            eprintln!("Read callback: {:?}", msg);
             let LinKvPayload::WriteOk = msg.body().payload.clone() else {
                 return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
             };
-            callback(Message::to_payload(orig_msg)?, state, ctx);
+            callback(Message::to_payload(orig_msg)?, state, ctx)?;
             Ok(CallbackStatus::Finished)
         };
 
@@ -198,10 +211,11 @@ impl LinKv {
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
               -> Result<CallbackStatus> {
+            eprintln!("Read callback: {:?}", msg);
             let LinKvPayload::CasOk = msg.body().payload.clone() else {
                 return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
             };
-            callback(Message::to_payload(orig_msg)?, state, ctx);
+            callback(Message::to_payload(orig_msg)?, state, ctx)?;
             Ok(CallbackStatus::Finished)
         };
 

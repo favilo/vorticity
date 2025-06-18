@@ -166,7 +166,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
 
         let doc = yrs::Doc::new();
         let messages = doc.get_or_insert_array("messages");
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let neighborhood = context
             .neighbors()
             .iter()

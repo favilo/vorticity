@@ -55,7 +55,7 @@ where
     pub fn call(&mut self, msg: &Message<RpcPayload>, ctx: Context) -> Result<CallbackStatus> {
         (self.callback)(
             &self.unhandled_incoming_msg,
-            &mut self.state,
+            &mut *self.state,
             &mut self.sent_msgs,
             msg,
             ctx,

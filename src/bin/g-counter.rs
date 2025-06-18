@@ -49,7 +49,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     let old_val = self
                         .counter
                         .get(&txn, &self.doc.client_id().to_string())
-                        .unwrap_or(Out::Any(0.into()))
+                        .unwrap_or(yrs::Out::Any(0.into()))
                         .cast::<i64>()
                         .unwrap();
                     self.counter.insert(
@@ -158,7 +158,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
 
         let doc = yrs::Doc::new();
         let counter = doc.get_or_insert_map("counter");
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let neighborhood = context
             .neighbors()
             .iter()

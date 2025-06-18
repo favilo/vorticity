@@ -23,10 +23,12 @@ pub mod error;
 pub mod message;
 pub mod rpc;
 
-pub trait Handler {
+pub trait Handler: downcast::Any {
     fn can_handle(&self, json: &ToEvent) -> bool;
     fn step(&self, json: ToEvent, ctx: Context) -> Result<()>;
 }
+
+downcast::downcast!(dyn Handler);
 
 pub trait Node<S, Payload, InjectedPayload = ()> {
     fn init(runtime: &Runtime, state: S, context: Context) -> Result<Self>
@@ -54,12 +56,12 @@ impl Runtime {
         Self::default()
     }
 
-    pub fn with_handler<H>(&mut self, handler: H) -> Result<()>
+    pub fn with_handler<H>(&mut self, handler: H) -> &mut Self
     where
         H: Handler + 'static,
     {
         self.handlers.insert(TypeId::of::<H>(), Rc::new(handler));
-        Ok(())
+        self
     }
 
     pub fn get_handler<H>(&self) -> Option<Rc<dyn Handler>>

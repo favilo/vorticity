@@ -4,10 +4,10 @@ use base64::{
     engine::{GeneralPurpose, GeneralPurposeConfig},
     Engine,
 };
-use miette::{Context as _, IntoDiagnostic};
+use miette::{Context as _, IntoDiagnostic as _};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sloggers::{terminal::TerminalLoggerBuilder, Build as _};
+use sloggers::{terminal::TerminalLoggerBuilder, Build};
 use vorticity::{error::Result, Context, Event, Message, Node, Runtime};
 use yrs::{
     types::ToJson,
@@ -349,5 +349,6 @@ impl KafkaNode {
 impl KafkaNode {}
 
 fn main() -> Result<()> {
-    Runtime::new().run::<_, Payload, InjectedPayload, KafkaNode>(())
+    let runtime = Runtime::new();
+    runtime.run::<_, Payload, InjectedPayload, KafkaNode>(())
 }
