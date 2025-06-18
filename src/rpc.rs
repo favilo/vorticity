@@ -1,52 +1,52 @@
-// use std::{collections::HashMap, marker::PhantomData};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-// use miette::Context as _;
-// use serde::{de::DeserializeOwned, Serialize};
+use crate::{error::Result, message::MessageSet, Context, Message};
 
-// use crate::{Handler, Message};
+pub mod lin_kv;
 
-// type HandlerFunc<Payload> = fn(Message<Payload>, Payload) -> Option<Message<Payload>>;
+pub enum CallbackStatus {
+    MoreWork,
+    Finished,
+}
 
-// pub struct RpcHandler<Payload> {
-//     callbacks: HashMap<usize, CallbackData<Payload>>,
-//     state: PhantomData<Payload>,
-// }
+pub type RpcCallback<RpcPayload> = dyn Fn(
+    &Message<Value>,
+    &mut MessageSet<RpcPayload>,
+    &Message<RpcPayload>,
+    Context,
+) -> Result<CallbackStatus>;
 
-// #[derive(Debug, Clone)]
-// struct CallbackData<Payload> {
-//     reply_to: Message<Payload>,
-//     callback: Box<HandlerFunc<Payload>>,
-// }
+pub struct CallbackInfo<RpcPayload> {
+    unhandled_incoming_msg: Message<Value>,
+    sent_msgs: MessageSet<RpcPayload>,
+    callback: Box<RpcCallback<RpcPayload>>,
+}
 
-// impl<Payload> Handler for RpcHandler<Payload>
-// where
-//     Payload: Serialize + DeserializeOwned + Sync + Send + 'static,
-// {
-//     fn can_handle(&self, json: &serde_json::Value) -> bool {
-//         serde_json::from_value::<Message<Payload>>(json.clone()).is_ok()
-//     }
+impl<RpcPayload> CallbackInfo<RpcPayload>
+where
+    RpcPayload: Clone + Serialize + for<'de> Deserialize<'de> + 'static,
+{
+    fn new<Payload>(
+        orig_msg: Message<Payload>,
+        sent_msgs: MessageSet<RpcPayload>,
+        callback: Box<RpcCallback<RpcPayload>>,
+    ) -> Self
+    where
+        Payload: Clone + Serialize + for<'de> Deserialize<'de>,
+    {
+        Self {
+            unhandled_incoming_msg: orig_msg.to_value(),
+            sent_msgs,
+            callback: Box::new(callback),
+        }
+    }
 
-//     fn step(
-//         &mut self,
-//         json: serde_json::Value,
-//         ctx: crate::Context<Payload>,
-//     ) -> anyhow::Result<()> {
-//         let input: Message<Payload> = serde_json::from_value(json)?;
-//         let msg_id = input
-//             .body
-//             .in_reply_to
-//             .ok_or_else(|| anyhow::anyhow!("Message reply id not specified"))?;
-//         let Some(callback) = self.callbacks.remove(&msg_id) else {
-//             anyhow::bail!("Message wasn't registered");
-//         };
-//         let reply = (callback.callback)(callback.reply_to, input.body.payload);
-//         if let Some(reply) = reply {
-//             ctx.send(reply)
-//                 .context("Sending response RPC from handler")?;
-//         }
+    pub fn matches(&self, msg: &Message<RpcPayload>) -> bool {
+        self.sent_msgs.is_matching_reply(msg) && self.unhandled_incoming_msg.dst() == msg.dst()
+    }
 
-//         Ok(())
-//     }
-// }
-
-// impl<In> RpcHandler<In> {}
+    pub fn call(&mut self, msg: &Message<RpcPayload>, ctx: Context) -> Result<CallbackStatus> {
+        (self.callback)(&self.unhandled_incoming_msg, &mut self.sent_msgs, msg, ctx)
+    }
+}

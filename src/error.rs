@@ -1,5 +1,8 @@
 use miette::Diagnostic;
+use serde_json::Value;
 use thiserror::Error;
+
+use crate::{message::ToEvent, Message};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -17,11 +20,19 @@ pub enum Error {
 
     #[error("Send error: {0}")]
     SendError(#[from] std::sync::mpsc::SendError<()>),
-}
 
-#[derive(Error, Debug, Diagnostic)]
-#[error("join error")]
-pub struct JoinError;
+    #[error("Not a reply: {0:?}")]
+    NotReply(ToEvent),
+
+    #[error("Wrong Event type: {0:?}")]
+    WrongEvent(ToEvent),
+
+    #[error("No handler registered for type: {0:?}")]
+    NoHandler(ToEvent),
+
+    #[error("No callback registered for message: {0:?}")]
+    NoCallback(Message<Value>),
+}
 
 impl From<miette::Report> for Error {
     fn from(value: miette::Report) -> Self {
