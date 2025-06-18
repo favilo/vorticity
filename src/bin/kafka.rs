@@ -14,16 +14,15 @@ use vorticity::{
 use yrs::{
     types::ToJson,
     updates::{decoder::Decode, encoder::Encode},
-    Array, ArrayPrelim, ArrayRef, Map, ReadTxn, Transact, Value,
+    Array, ArrayPrelim, ArrayRef, Map, Out, ReadTxn, Transact,
 };
-
-// mod kafka_lib;
 
 const ENGINE: GeneralPurpose =
     GeneralPurpose::new(&base64::alphabet::URL_SAFE, GeneralPurposeConfig::new());
 
 type Msg = yrs::Any;
 
+#[allow(dead_code)]
 enum CallbackStatus {
     MoreWork,
     Finished,
@@ -42,6 +41,7 @@ struct CallbackInfo {
     callback: Box<RpcCallback>,
 }
 
+#[allow(dead_code)]
 impl CallbackInfo {
     fn new(
         orig_msg: Message<Payload>,
@@ -179,11 +179,11 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         let doc = yrs::Doc::new();
         let logs = doc.get_or_insert_map("counter");
         let offsets = doc.get_or_insert_map("offsets");
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let neighborhood = init
             .node_ids
             .iter()
-            .filter(|&_| rng.gen_bool(0.75))
+            .filter(|&_| rng.random_bool(0.75))
             .cloned()
             .collect();
         Ok(Self {
@@ -257,15 +257,15 @@ impl KafkaNode {
             }
             let remote_state_vector = &self.known[n];
             let txn = self.doc.transact();
-            let diff = ENGINE.encode(&txn.encode_diff_v1(remote_state_vector));
+            let diff = ENGINE.encode(txn.encode_diff_v1(remote_state_vector));
             let state_vector = &txn.state_vector();
 
             // Send the update 10% of the time, even if it's the same as the remote state
-            let mut rng = rand::thread_rng();
-            if remote_state_vector == state_vector && !rng.gen_bool(0.1) {
+            let mut rng = rand::rng();
+            if remote_state_vector == state_vector && !rng.random_bool(0.1) {
                 continue;
             }
-            let state_vector = ENGINE.encode(&state_vector.encode_v1());
+            let state_vector = ENGINE.encode(state_vector.encode_v1());
             eprintln!(
                 "sending state_vector to {}: {} bytes",
                 n,
@@ -279,7 +279,7 @@ impl KafkaNode {
                     .payload(Payload::Admin(AdminPayload::Gossip { state_vector, diff }))
                     .build()?,
             )
-            .with_context(|| format!("sending Gossip to {}", n))?;
+            .with_context(|| format!("sending Gossip to {n}"))?;
         }
 
         Ok(())
@@ -306,7 +306,7 @@ impl KafkaNode {
                         .context("Update decode failed")?;
                 self.known.insert(input.src().to_string(), state_vector);
                 let mut txn = self.doc.transact_mut();
-                txn.apply_update(update);
+                txn.apply_update(update)?;
             }
         };
 
@@ -323,7 +323,7 @@ impl KafkaNode {
         let mut txn = self.doc.transact_mut();
         let list = self.logs.get(&txn, key);
         let list = match list {
-            Some(Value::YArray(list)) => list,
+            Some(Out::YArray(list)) => list,
             _ => {
                 let list: ArrayRef = self.logs.insert(&mut txn, key, ArrayPrelim::default());
                 list
@@ -397,7 +397,7 @@ impl KafkaNode {
                     k.clone(),
                     self.offsets
                         .get(&txn, k)
-                        .unwrap_or(Value::Any(0.into()))
+                        .unwrap_or(Out::Any(0.into()))
                         .cast::<i64>()
                         .unwrap() as u64,
                 )

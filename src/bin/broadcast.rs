@@ -106,7 +106,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     .context("Update decode failed")?;
                     self.known.insert(input.src().to_string(), state_vector);
                     let mut txn = self.doc.transact_mut();
-                    txn.apply_update(update);
+                    txn.apply_update(update)?;
                 }
                 Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
             },
@@ -120,8 +120,8 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         let state_vector = &txn.state_vector();
 
                         // Send the update 10% of the time, even if it's the same as the remote state
-                        let mut rng = rand::thread_rng();
-                        if remote_state_vector == state_vector && !rng.gen_bool(0.1) {
+                        let mut rng = rand::rng();
+                        if remote_state_vector == state_vector && !rng.random_bool(0.1) {
                             continue;
                         }
                         let state_vector = ENGINE.encode(&state_vector.encode_v1());
@@ -139,7 +139,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                                 .payload(Payload::Gossip { state_vector, diff })
                                 .build()?,
                         )
-                        .with_context(|| format!("sending Gossip to {}", n))?;
+                        .with_context(|| format!("sending Gossip to {n}"))?;
                     }
                 }
             },
@@ -166,11 +166,11 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
 
         let doc = yrs::Doc::new();
         let messages = doc.get_or_insert_array("messages");
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let neighborhood = init
             .node_ids
             .iter()
-            .filter(|&_| rng.gen_bool(0.75))
+            .filter(|&_| rng.random_bool(0.75))
             .cloned()
             .collect();
         Ok(Self {

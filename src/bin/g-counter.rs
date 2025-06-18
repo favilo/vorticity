@@ -9,8 +9,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use vorticity::{Context, Event, Init, Message, Node, Runtime};
 use yrs::{
-    updates::{decoder::Decode, encoder::Encode},
-    Map, ReadTxn, Transact,
+    updates::{decoder::Decode, encoder::Encode}, Map, Out, ReadTxn, Transact
 };
 
 const ENGINE: GeneralPurpose =
@@ -55,7 +54,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     let old_val = self
                         .counter
                         .get(&txn, &self.doc.client_id().to_string())
-                        .unwrap_or(yrs::Value::Any(0.into()))
+                        .unwrap_or(Out::Any(0.into()))
                         .cast::<i64>()
                         .unwrap();
                     self.counter.insert(
@@ -100,7 +99,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     .context("Update decode failed")?;
                     self.known.insert(input.src().to_string(), state_vector);
                     let mut txn = self.doc.transact_mut();
-                    txn.apply_update(update);
+                    txn.apply_update(update)?;
                 }
                 Payload::AddOk | Payload::ReadOk { .. } => {}
             },
@@ -110,12 +109,12 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     for n in &self.neighborhood {
                         let remote_state_vector = &self.known[n];
                         let txn = self.doc.transact();
-                        let diff = ENGINE.encode(&txn.encode_diff_v1(remote_state_vector));
+                        let diff = ENGINE.encode(txn.encode_diff_v1(remote_state_vector));
                         let state_vector = &txn.state_vector();
 
                         // Send the update 10% of the time, even if it's the same as the remote state
-                        let mut rng = rand::thread_rng();
-                        if remote_state_vector == state_vector && !rng.gen_bool(0.1) {
+                        let mut rng = rand::rng();
+                        if remote_state_vector == state_vector && !rng.random_bool(0.1) {
                             continue;
                         }
                         let state_vector = ENGINE.encode(&state_vector.encode_v1());
@@ -159,11 +158,11 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
 
         let doc = yrs::Doc::new();
         let counter = doc.get_or_insert_map("counter");
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let neighborhood = init
             .node_ids
             .iter()
-            .filter(|&_| rng.gen_bool(0.75))
+            .filter(|&_| rng.random_bool(0.75))
             .cloned()
             .collect();
         Ok(Self {

@@ -282,6 +282,7 @@ impl<IP> Context<IP> {
     }
 }
 
+#[allow(dead_code)]
 pub struct MessageSet<Payload> {
     /// The messages that have been sent and are still waiting for a reply.
     messages: HashMap<usize, Message<Payload>>,
