@@ -75,6 +75,8 @@ pub struct KafkaNode {
     offsets: yrs::MapRef,
     known: HashMap<String, yrs::StateVector>,
     neighborhood: Vec<String>,
+
+    callbacks: HashMap<usize, Box<dyn FnOnce(Result<Payload>, Context) + Send>>,
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
@@ -139,12 +141,17 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         let logs = doc.get_or_insert_map("counter");
         let offsets = doc.get_or_insert_map("offsets");
         let mut rng = rand::rng();
+        let node_count = context.neighbors().count();
         let neighborhood = context
             .neighbors()
-            .iter()
-            .filter(|&id| id != context.node_id())
-            .filter(|&_| rng.random_bool(0.75))
-            .cloned()
+            .filter(|&_| {
+                if cfg!(test) || node_count < 5 {
+                    true
+                } else {
+                    rng.random_bool(0.75)
+                }
+            })
+            .map(String::from)
             .collect();
         Ok(Self {
             doc,
@@ -152,11 +159,12 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
             offsets,
             known: context
                 .neighbors()
-                .iter()
-                .cloned()
+                .map(String::from)
                 .map(|nid| (nid, Default::default()))
                 .collect(),
             neighborhood,
+
+            callbacks: HashMap::new(),
         })
     }
 
@@ -185,15 +193,20 @@ impl KafkaNode {
     }
 
     fn send_gossip(&mut self, ctx: &Context) -> Result<()> {
+        eprintln!("Sending gossip to {} neighbors...", self.neighborhood.len());
         for n in &self.neighborhood {
+            eprintln!("Gossiping to {n}");
             let remote_state_vector = &self.known[n];
+            eprintln!("Remote state vector for {n}: {remote_state_vector:?}");
             let txn = self.doc.transact();
             let diff = ENGINE.encode(txn.encode_diff_v1(remote_state_vector));
             let state_vector = &txn.state_vector();
+            eprintln!("Local state vector: {state_vector:?}");
 
             // Send the update 10% of the time, even if it's the same as the remote state
             let mut rng = rand::rng();
             if remote_state_vector == state_vector && !rng.random_bool(0.1) {
+                eprintln!("Skipping gossip to {n}: state vector is the same");
                 continue;
             }
             let state_vector = ENGINE.encode(state_vector.encode_v1());
@@ -351,4 +364,151 @@ impl KafkaNode {}
 fn main() -> Result<()> {
     let runtime = Runtime::new();
     runtime.run::<_, Payload, InjectedPayload, KafkaNode>(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{atomic::AtomicUsize, mpsc};
+
+    use super::*;
+    use miette::IntoDiagnostic;
+    use yrs::StateVector;
+
+    #[test]
+    fn send_to_send_ok() -> Result<()> {
+        let (n1_msg_out_tx, n1_msg_out_rx) = mpsc::channel();
+        let n1_ctx = Context::new(
+            "node1",
+            &["node1".to_string(), "node2".to_string()],
+            mpsc::channel().0,
+            n1_msg_out_tx,
+            AtomicUsize::new(0).into(),
+        );
+        let client_ctx = Context::new(
+            "c",
+            &["node1".to_string(), "node2".to_string()],
+            mpsc::channel().0,
+            mpsc::channel().0,
+            AtomicUsize::new(0).into(),
+        );
+        let mut node = KafkaNode::init(&Runtime::new(), (), n1_ctx.clone()).into_diagnostic()?;
+        let msg = Message::builder(client_ctx.clone())
+            .dst("node1")
+            .payload(Payload::Send {
+                key: "test_key".to_string(),
+                msg: Msg::from("test_message"),
+            })
+            .build()
+            .into_diagnostic()?;
+        node.step(Event::Message(msg), n1_ctx.clone())
+            .into_diagnostic()
+            .context("step failed")?;
+
+        let reply = serde_json::to_string(&n1_msg_out_rx.recv().into_diagnostic()?)
+            .into_diagnostic()
+            .context("failed to serialize reply")?;
+        let reply = serde_json::from_str::<Message<Payload>>(&reply)
+            .into_diagnostic()
+            .context("failed to deserialize reply")?
+            .body()
+            .payload
+            .clone();
+        assert!(
+            matches!(reply, Payload::SendOk { offset: 0 }),
+            "Expected SendOk with offset 0",
+        );
+
+        let txn = node.doc.transact();
+        let list = node.logs.get(&txn, "test_key").unwrap();
+        assert_eq!(
+            list.cast::<ArrayRef>().unwrap().len(&txn),
+            1,
+            "Expected one message in the log"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gossip_sends() {
+        let (n1_msg_out_tx, n1_msg_out_rx) = mpsc::channel();
+        let n1_ctx = Context::new(
+            "node1",
+            &["node1".to_string(), "node2".to_string()],
+            mpsc::channel().0,
+            n1_msg_out_tx,
+            AtomicUsize::new(0).into(),
+        );
+        let client_ctx = Context::new(
+            "c",
+            &["node1".to_string(), "node2".to_string()],
+            mpsc::channel().0,
+            mpsc::channel().0,
+            AtomicUsize::new(0).into(),
+        );
+
+        let mut node = KafkaNode::init(&Runtime::new(), (), n1_ctx.clone())
+            .expect("node initialization failed");
+        let msg = Message::builder(client_ctx.clone())
+            .dst("node1")
+            .payload(Payload::Send {
+                key: "test_key".to_string(),
+                msg: Msg::from("test_message"),
+            })
+            .build()
+            .unwrap();
+        eprintln!("Sending message to node...");
+        node.step(Event::Message(msg), n1_ctx.clone())
+            .expect("Send step failed");
+
+        eprintln!("Waiting for SendOk reply...");
+        n1_msg_out_rx
+            .recv_timeout(Duration::from_secs(0))
+            .expect("Failed to receive SendOk reply");
+
+        eprintln!("Checking log for message...");
+        {
+            let txn = node.doc.transact();
+            let list = node.logs.get(&txn, "test_key").unwrap();
+            assert_eq!(
+                list.cast::<ArrayRef>().unwrap().len(&txn),
+                1,
+                "Expected one message in the log"
+            );
+        }
+
+        eprintln!("Injecting Gossip event...");
+        node.step(Event::Injected(InjectedPayload::Gossip), n1_ctx.clone())
+            .expect("Gossip step failed");
+
+        eprintln!("Waiting for Gossip reply...");
+        let reply = serde_json::to_string(
+            &n1_msg_out_rx
+                .recv_timeout(Duration::from_secs(0))
+                .expect("Failed to receive reply"),
+        )
+        .expect("Failed to serialize reply");
+        let reply = serde_json::from_str::<Message<Payload>>(&reply)
+            .expect("Failed to deserialize reply")
+            .body()
+            .payload
+            .clone();
+        assert!(
+            matches!(reply, Payload::Admin(AdminPayload::Gossip { .. })),
+            "Expected Admin Gossip payload",
+        );
+        let Payload::Admin(AdminPayload::Gossip { state_vector, diff }) = reply else {
+            panic!("Expected Admin Gossip payload");
+        };
+        let txn = node.doc.transact();
+        assert_eq!(
+            state_vector,
+            ENGINE.encode(txn.state_vector().encode_v1()),
+            "State vector should be equal"
+        );
+        assert_eq!(
+            diff,
+            ENGINE.encode(txn.encode_diff_v1(&StateVector::default())),
+            "Diff should be empty"
+        );
+    }
 }

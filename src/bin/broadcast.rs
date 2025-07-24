@@ -117,7 +117,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     for n in &self.neighborhood {
                         let remote_state_vector = &self.known[n];
                         let txn = self.doc.transact();
-                        let diff = ENGINE.encode(&txn.encode_diff_v1(remote_state_vector));
+                        let diff = ENGINE.encode(txn.encode_diff_v1(remote_state_vector));
                         let state_vector = &txn.state_vector();
 
                         // Send the update 10% of the time, even if it's the same as the remote state
@@ -125,7 +125,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         if remote_state_vector == state_vector && !rng.random_bool(0.1) {
                             continue;
                         }
-                        let state_vector = ENGINE.encode(&state_vector.encode_v1());
+                        let state_vector = ENGINE.encode(state_vector.encode_v1());
                         eprintln!(
                             "sending state_vector to {}: {} bytes",
                             n,
@@ -169,18 +169,15 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         let mut rng = rand::rng();
         let neighborhood = context
             .neighbors()
-            .iter()
-            .filter(|&id| id != context.node_id())
             .filter(|&_| rng.random_bool(0.75))
-            .cloned()
+            .map(String::from)
             .collect();
         Ok(Self {
             doc,
             messages,
             known: context
                 .neighbors()
-                .iter()
-                .cloned()
+                .map(String::from)
                 .map(|nid| (nid, Default::default()))
                 .collect(),
             neighborhood,

@@ -88,8 +88,7 @@ impl Runtime {
         let node = node;
 
         std::thread::scope(|scope| -> Result<()> {
-            let stdin_tx = msg_in_tx.clone();
-            receive_loop(scope, stdin_tx, msg_in_tx);
+            receive_loop(scope, msg_in_tx);
 
             send_loop(scope, msg_out_rx);
             event_loop(&self, msg_in_rx, node, context)
@@ -152,7 +151,6 @@ where
 
 fn receive_loop<'s>(
     scope: &'s thread::Scope<'s, '_>,
-    stdin_tx: Sender<ToEvent>,
     msg_in_tx: Sender<ToEvent>,
 ) -> thread::ScopedJoinHandle<'s, Result<()>> {
     scope.spawn(move || {
@@ -160,7 +158,7 @@ fn receive_loop<'s>(
         for line in stdin.lines() {
             let line = line?;
             let input: Message<serde_json::Value> = serde_json::from_str(&line)?;
-            if stdin_tx.send(ToEvent::Message(input)).is_err() {
+            if msg_in_tx.send(ToEvent::Message(input)).is_err() {
                 break;
             }
         }
@@ -200,9 +198,9 @@ where
             if input.is_reply() {
                 // TODO: Figure out how to get original Message from our RPC system
                 node.handle_reply(input, context.clone())?;
-                continue;
+            } else {
+                node.step(input, context.clone())?;
             }
-            node.step(input, context.clone())?;
         } else {
             let handler = runtime.handlers.values().find(|h| h.can_handle(&input));
             let Some(handler) = handler else {

@@ -132,11 +132,11 @@ impl LinKv {
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
               -> Result<CallbackStatus> {
-            eprintln!("Read callback: {:?}", msg);
+            eprintln!("Read callback: {msg:?}");
             let value = match msg.body().payload.clone() {
                 LinKvPayload::ReadOk { value } => value,
                 LinKvPayload::Error { text, code } => {
-                    eprintln!("Key didn't exist error: {}: {}", code, text);
+                    eprintln!("Key didn't exist error: {code}: {text}");
                     Value::Array(Vec::new())
                 }
                 _ => {
@@ -175,7 +175,7 @@ impl LinKv {
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
               -> Result<CallbackStatus> {
-            eprintln!("Read callback: {:?}", msg);
+            eprintln!("Read callback: {msg:?}");
             let LinKvPayload::WriteOk = msg.body().payload.clone() else {
                 return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
             };
@@ -211,7 +211,7 @@ impl LinKv {
                                      msg: &Message<LinKvPayload>,
                                      ctx: Context|
               -> Result<CallbackStatus> {
-            eprintln!("Read callback: {:?}", msg);
+            eprintln!("Read callback: {msg:?}");
             let LinKvPayload::CasOk = msg.body().payload.clone() else {
                 return Err(Error::WrongEvent(ToEvent::Message(msg.to_value())));
             };

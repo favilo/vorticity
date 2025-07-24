@@ -34,6 +34,12 @@ impl<Payload> MessageBuilder<Payload> {
         self
     }
 
+    #[cfg(test)]
+    pub fn with_id(mut self, id: usize) -> Self {
+        self.id = Some(id);
+        self
+    }
+
     pub fn id(mut self, ctx: Context) -> Self {
         self.id = Some(ctx.next_msg_id());
         self
@@ -347,8 +353,11 @@ impl Context {
         &self.node_id
     }
 
-    pub fn neighbors(&self) -> &[String] {
-        &self.nodes
+    pub fn neighbors(&self) -> impl Iterator<Item = &str> {
+        self.nodes
+            .iter()
+            .filter(|&n| n.as_str() != self.node_id.as_ref())
+            .map(String::as_str)
     }
 }
 

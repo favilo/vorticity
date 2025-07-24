@@ -9,7 +9,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use vorticity::{error::Result, Context, Event, Message, Node, Runtime};
 use yrs::{
-    updates::{decoder::Decode, encoder::Encode}, Map, Out, ReadTxn, Transact
+    updates::{decoder::Decode, encoder::Encode},
+    Map, Out, ReadTxn, Transact,
 };
 
 const ENGINE: GeneralPurpose =
@@ -49,7 +50,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                     let old_val = self
                         .counter
                         .get(&txn, &self.doc.client_id().to_string())
-                        .unwrap_or(yrs::Out::Any(0.into()))
+                        .unwrap_or(Out::Any(0.into()))
                         .cast::<i64>()
                         .unwrap();
                     self.counter.insert(
@@ -118,7 +119,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                         if remote_state_vector == state_vector && !rng.random_bool(0.1) {
                             continue;
                         }
-                        let state_vector = ENGINE.encode(&state_vector.encode_v1());
+                        let state_vector = ENGINE.encode(state_vector.encode_v1());
                         eprintln!(
                             "sending state_vector to {}: {} bytes",
                             n,
@@ -131,7 +132,7 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
                                 .payload(Payload::Gossip { state_vector, diff })
                                 .build()?,
                         )
-                        .with_context(|| format!("sending Gossip to {}", n))?;
+                        .with_context(|| format!("sending Gossip to {n}"))?;
                     }
                 }
             },
@@ -161,19 +162,15 @@ impl Node<(), Payload, InjectedPayload> for GCounterNode {
         let mut rng = rand::rng();
         let neighborhood = context
             .neighbors()
-            .iter()
-            .filter(|&n| n != &init.node_id)
-            .filter(|&n| n != context.node_id())
             .filter(|&_| rng.random_bool(0.75))
-            .cloned()
+            .map(|nid| nid.to_string())
             .collect();
         Ok(Self {
             doc,
             counter,
             known: context
                 .neighbors()
-                .iter()
-                .cloned()
+                .map(|nid| nid.to_string())
                 .map(|nid| (nid, Default::default()))
                 .collect(),
             neighborhood,
